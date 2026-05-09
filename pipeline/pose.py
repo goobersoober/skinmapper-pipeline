@@ -85,18 +85,21 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
             dst.write_bytes(p.read_bytes())
 
     # ----- write cameras.txt (one PINHOLE per image) -----
+    # MASt3R's `load_images(..., size=512)` resizes the *long edge* to 512
+    # while preserving aspect ratio. So for a 1600×1200 input the working
+    # frame is 512×384, and the intrinsics it returns are in that frame.
+    # We therefore scale by a SINGLE long-edge ratio, not separate sx/sy.
+    mast3r_long = 512
     with (sparse_dir / "cameras.txt").open("w") as f:
         for i, K in enumerate(intrinsics, start=1):
             img = Image.open(image_paths[i - 1])
             w, h = img.size
             fx, fy = float(K[0, 0]), float(K[1, 1])
             cx, cy = float(K[0, 2]), float(K[1, 2])
-            # Scale intrinsics from MASt3R's working size (512) to native res
-            mast3r_size = 512
-            sx = w / mast3r_size
-            sy = h / mast3r_size
+            scale = max(w, h) / mast3r_long
             f.write(f"{i} PINHOLE {w} {h} "
-                    f"{fx*sx:.4f} {fy*sy:.4f} {cx*sx:.4f} {cy*sy:.4f}\n")
+                    f"{fx*scale:.4f} {fy*scale:.4f} "
+                    f"{cx*scale:.4f} {cy*scale:.4f}\n")
 
     # ----- write images.txt (extrinsic per image) -----
     def mat_to_quat(R: np.ndarray) -> np.ndarray:
@@ -169,17 +172,22 @@ def densify_points_with_depth(workdir: Path, depth_dir: Path,
     """
     Append depth-prior points to points3D.txt.
 
-    Each photo has a Depth Anything v2 relative-depth map and a SAM 2 limb
-    mask. We sample N points inside the mask, back-project them to 3D using
-    the MASt3R-recovered camera, and write them out in COLMAP format.
+    For each photo:
+      1. Read the Depth Anything v2 relative-depth map + SAM 2 limb mask.
+      2. Project the existing MASt3R world points into this camera. Their
+         z-coords give us metric depth at known image pixels.
+      3. Sample the relative depth at those same pixels.
+      4. Least-squares fit  a*relative + b = metric  using RANSAC for
+         robustness against outliers (depth-net failures, occlusions).
+      5. Apply (a, b) to the full depth map → metric depth per pixel.
+      6. Sample N points inside the mask, back-project to 3D world coords
+         using the metric depth, append to points3D.txt.
 
-    The depth is *relative* (Depth Anything is monocular — no metric scale)
-    so we align it to MASt3R's metric scale by fitting a per-view linear
-    transform (a, b) such that a*relative + b best matches MASt3R's depth at
-    a sparse set of high-confidence overlap pixels. If alignment fails we
-    fall back to using the median MASt3R depth as the anchor.
+    Why bother: 2DGS bootstraps from points3D.txt. The denser + more
+    accurate the init, the faster + smoother the convergence — especially
+    on textureless skin where photometric loss has nothing to chase.
 
-    Returns: { added: int, aligned_views: int, fallback_views: int }
+    Returns: { added, aligned_views, fallback_views, ransac_views }
     """
     import cv2
     sparse = workdir / "sparse" / "0"
@@ -226,50 +234,134 @@ def densify_points_with_depth(workdir: Path, depth_dir: Path,
             [s * (qx * qz - qy * qw), s * (qy * qz + qx * qw), 1 - s * (qx * qx + qy * qy)],
         ])
 
-    # Append to points3D.txt
-    rng = np.random.default_rng(42)
-    next_id = 1
+    # Read existing world points (from MASt3R) — used as alignment ground truth
+    world_points = []
     if points_path.exists():
         for line in points_path.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
             try:
-                next_id = max(next_id, int(line.split()[0]) + 1)
-            except Exception:
-                pass
+                world_points.append((int(parts[0]),
+                                     float(parts[1]), float(parts[2]),
+                                     float(parts[3])))
+            except ValueError:
+                continue
+    P_world_existing = np.array([[x, y, z] for _, x, y, z in world_points],
+                                dtype=np.float64) if world_points else np.zeros((0, 3))
+    next_id = (max((pid for pid, *_ in world_points), default=0) + 1
+               if world_points else 1)
 
+    rng = np.random.default_rng(42)
     added = 0
     aligned = 0
+    ransac_views = 0
     fallback = 0
+
+    def fit_ransac(rel: np.ndarray, met: np.ndarray,
+                   iters: int = 200, inlier_thr: float = 0.05
+                   ) -> tuple[float, float, int] | None:
+        """RANSAC fit a*rel + b = met. Returns (a, b, n_inliers) or None."""
+        n = len(rel)
+        if n < 8:
+            return None
+        best = None
+        for _ in range(iters):
+            i, j = rng.choice(n, 2, replace=False)
+            if abs(rel[i] - rel[j]) < 1e-3:
+                continue
+            a = (met[i] - met[j]) / (rel[i] - rel[j])
+            b = met[i] - a * rel[i]
+            if a < 1e-3:  # depth must increase with relative depth
+                continue
+            err = np.abs(a * rel + b - met)
+            inliers = err < (inlier_thr * np.median(np.abs(met)) + 1e-3)
+            n_in = int(inliers.sum())
+            if best is None or n_in > best[2]:
+                best = (a, b, n_in, inliers)
+        if best is None or best[2] < 8:
+            return None
+        # Refit on inliers via least squares
+        a, b, n_in, inliers = best
+        A = np.stack([rel[inliers], np.ones(n_in)], axis=1)
+        sol, *_ = np.linalg.lstsq(A, met[inliers], rcond=None)
+        return float(sol[0]), float(sol[1]), n_in
+
     with points_path.open("a") as f:
         for jp in jpeg_paths:
             depth_p = depth_dir / (jp.stem + ".png")
-            mask_p  = mask_dir  / (jp.stem + ".png")
+            mask_p  = mask_dir  / (jp.stem + ".png") if mask_dir else None
             if not depth_p.exists():
                 continue
             depth = cv2.imread(str(depth_p), cv2.IMREAD_UNCHANGED)
             if depth is None:
                 continue
-            # depth was written as 16-bit normalised within mask
             depth = depth.astype(np.float32) / 65535.0
 
             mask = None
-            if mask_p.exists():
+            if mask_p is not None and mask_p.exists():
                 mask = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE) > 127
 
             pose = name_to_pose.get(jp.name)
             if pose is None:
                 continue
             cam = cams[pose["camera_id"]]
-            R_wc = quat_to_rot(pose["qvec"])    # world→cam
+            R_wc = quat_to_rot(pose["qvec"])      # world→cam
             t_wc = np.array(pose["tvec"])
-            # cam→world = inverse of (R_wc, t_wc)
             R_cw = R_wc.T
             t_cw = -R_wc.T @ t_wc
 
             h, w = depth.shape
-            # Sample pixels inside mask (or full image if no mask)
+            fx, fy, cx, cy = cam["fx"], cam["fy"], cam["cx"], cam["cy"]
+            scale_dx = w / cam["w"]
+            scale_dy = h / cam["h"]
+
+            # ---- Step A: project existing MASt3R points into this view ----
+            # → produces (rel, metric) pairs for affine fitting
+            (a_fit, b_fit) = (None, None)
+            if len(P_world_existing) > 0:
+                P_cam = (R_wc @ P_world_existing.T).T + t_wc
+                z = P_cam[:, 2]
+                in_front = z > 1e-3
+                if in_front.any():
+                    u_px = (P_cam[in_front, 0] / z[in_front] * fx + cx) * scale_dx
+                    v_px = (P_cam[in_front, 1] / z[in_front] * fy + cy) * scale_dy
+                    z_in = z[in_front]
+                    inside = (u_px >= 0) & (u_px < w) & (v_px >= 0) & (v_px < h)
+                    if inside.any():
+                        u_i = u_px[inside].astype(np.int32)
+                        v_i = v_px[inside].astype(np.int32)
+                        z_i = z_in[inside]
+                        rel_at_pts = depth[v_i, u_i]
+                        # Drop pixels where depth is 0 (mask bg)
+                        valid = rel_at_pts > 0.01
+                        if valid.sum() >= 12:
+                            res = fit_ransac(rel_at_pts[valid], z_i[valid])
+                            if res is not None:
+                                a_fit, b_fit, n_in = res
+                                ransac_views += 1
+                                aligned += 1
+
+            # ---- Step B: fallback alignment if RANSAC failed ----
+            if a_fit is None:
+                scene_anchor = float(np.linalg.norm(t_cw))
+                if scene_anchor < 1e-6:
+                    fallback += 1
+                    continue
+                # Map relative percentile range to ±30% of scene_anchor
+                d_min_pct = float(np.percentile(depth[depth > 0.01], 5))
+                d_max_pct = float(np.percentile(depth[depth > 0.01], 95))
+                if d_max_pct - d_min_pct < 1e-3:
+                    fallback += 1
+                    continue
+                a_fit = (0.6 * scene_anchor) / (d_max_pct - d_min_pct)
+                b_fit = scene_anchor * 0.7 - a_fit * d_min_pct
+                fallback += 1
+
+            # ---- Step C: sample mask interior, back-project ----
             if mask is not None and mask.any():
                 ys, xs = np.where(mask)
             else:
@@ -281,51 +373,30 @@ def densify_points_with_depth(workdir: Path, depth_dir: Path,
                 sel = rng.choice(len(ys), samples_per_view, replace=False)
                 ys, xs = ys[sel], xs[sel]
 
-            # Image coords → camera-frame rays
-            fx, fy, cx, cy = cam["fx"], cam["fy"], cam["cx"], cam["cy"]
-            # Resize cam intrinsics to depth-map resolution
-            sx = w / cam["w"]
-            sy = h / cam["h"]
-            x_cam = (xs - cx * sx) / (fx * sx)
-            y_cam = (ys - cy * sy) / (fy * sy)
             d_rel = depth[ys, xs]
-            # Skip zero-depth (out-of-mask) pixels
             valid = d_rel > 0.01
             if not valid.any():
                 continue
-            x_cam, y_cam, d_rel = x_cam[valid], y_cam[valid], d_rel[valid]
-            xs_v, ys_v = xs[valid], ys[valid]
+            ys, xs, d_rel = ys[valid], xs[valid], d_rel[valid]
 
-            # ---- align relative depth to metric scale ----
-            # Use median scene depth from MASt3R as a coarse anchor:
-            #   target_depth ≈ ||t_cw|| (camera distance from world origin)
-            scene_anchor = float(np.linalg.norm(t_cw))
-            if scene_anchor < 1e-6:
-                fallback += 1
+            d_metric = a_fit * d_rel + b_fit
+            # Reject points behind the camera or absurdly far
+            ok = (d_metric > 0.05) & (d_metric < 10.0)
+            if not ok.any():
                 continue
-            # Fit a*d_rel + b so median(a*d_rel + b) == scene_anchor and the
-            # near/far range covers ~[0.5, 1.5] × scene_anchor — keeps points
-            # in front of the camera, avoids spreading them across infinity.
-            d_min = float(np.percentile(d_rel, 5))
-            d_max = float(np.percentile(d_rel, 95))
-            if d_max - d_min < 1e-3:
-                fallback += 1
-                continue
-            d_metric = scene_anchor * (0.7 + 0.6 * (d_rel - d_min) / (d_max - d_min))
-            aligned += 1
+            ys, xs, d_metric = ys[ok], xs[ok], d_metric[ok]
 
-            # Camera frame coordinates
-            X_cam = x_cam * d_metric
-            Y_cam = y_cam * d_metric
-            Z_cam = d_metric
-            P_cam = np.stack([X_cam, Y_cam, Z_cam], axis=1)  # (N, 3)
-
-            # Cam → world
+            # Image coords → camera-frame rays (in *image* pixel units)
+            x_cam = (xs - cx * scale_dx) / (fx * scale_dx) * d_metric
+            y_cam = (ys - cy * scale_dy) / (fy * scale_dy) * d_metric
+            P_cam = np.stack([x_cam, y_cam, d_metric], axis=1)
             P_world = (R_cw @ P_cam.T).T + t_cw
 
             for p in P_world:
-                f.write(f"{next_id} {p[0]:.5f} {p[1]:.5f} {p[2]:.5f} 220 200 180 0.5\n")
+                f.write(f"{next_id} {p[0]:.5f} {p[1]:.5f} {p[2]:.5f} "
+                        f"220 200 180 0.5\n")
                 next_id += 1
                 added += 1
 
-    return {"added": added, "aligned_views": aligned, "fallback_views": fallback}
+    return {"added": added, "aligned_views": aligned,
+            "ransac_views": ransac_views, "fallback_views": fallback}

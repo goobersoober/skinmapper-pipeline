@@ -157,6 +157,15 @@ def run_pipeline(job_input: dict) -> dict:
         stats["segmentation"] = seg_stats
         _step(f"SAM 2 — {seg_stats}", t_step)
 
+        # GUARD: catastrophic segmentation failure
+        seg_total = sum(seg_stats.values())
+        seg_real  = seg_stats.get("success", 0) + seg_stats.get("fallback", 0)
+        if seg_total > 0 and seg_real / seg_total < 0.5:
+            print(f"[seg] WARNING: only {seg_real}/{seg_total} photos "
+                  f"segmented — masks will be unreliable. Disabling "
+                  f"mask-based pixel rejection in texture bake.", flush=True)
+            mask_dir = None  # downstream falls back to using all pixels
+
         # 5. Depth Anything v2 priors — masked to limb only
         depth_dir = work / "depths"
         n_depth = estimate_depth_folder(jpeg_dir, depth_dir, mask_dir=mask_dir)
@@ -170,11 +179,23 @@ def run_pipeline(job_input: dict) -> dict:
         stats["pose"] = pose_stats
         _step(f"MASt3R poses — {pose_stats}", t_step)
 
-        # 6b. Densify points3D.txt with depth-prior projection.
+        # GUARD: pose registration must include enough photos to be useful
+        n_reg = pose_stats.get("n_registered", 0)
+        if n_reg < max(10, int(0.7 * len(jpeg_paths))):
+            raise RuntimeError(
+                f"Pose estimation registered only {n_reg}/{len(jpeg_paths)} "
+                f"photos — too few for reliable reconstruction. Likely cause: "
+                f"insufficient overlap between consecutive shots, or motion blur"
+            )
+
+        # 6b. Densify points3D.txt with depth-prior projection. Cap total
+        # added points to avoid OOM during 2DGS init.
+        MAX_DENSIFY = 200_000
+        per_view = max(1000, MAX_DENSIFY // max(1, len(jpeg_paths)))
         from pipeline.pose import densify_points_with_depth
         densify_stats = densify_points_with_depth(
             workdir=work, depth_dir=depth_dir, mask_dir=mask_dir,
-            jpeg_paths=jpeg_paths, samples_per_view=8000,
+            jpeg_paths=jpeg_paths, samples_per_view=per_view,
         )
         stats["depth_densify"] = densify_stats
         _step(f"Depth-init densify — {densify_stats}", t_step)
@@ -191,6 +212,23 @@ def run_pipeline(job_input: dict) -> dict:
         model_dir = work / "output"
         mesh_ply = extract_mesh(work, model_dir)
         _step(f"mesh extraction — {mesh_ply.name}", t_step)
+
+        # GUARD: validate mesh has actual content
+        try:
+            import trimesh
+            _check = trimesh.load(str(mesh_ply), process=False)
+            n_v, n_f = len(_check.vertices), len(_check.faces)
+            stats["mesh_raw"] = {"verts": n_v, "faces": n_f}
+            print(f"[mesh] raw mesh: {n_v} verts, {n_f} faces", flush=True)
+            if n_f < 1000:
+                raise RuntimeError(
+                    f"Extracted mesh has only {n_f} faces — TSDF fusion "
+                    f"likely failed. Check 2DGS training quality."
+                )
+        except RuntimeError:
+            raise
+        except Exception as _mc_e:
+            print(f"[mesh] mesh validation skipped: {_mc_e}", flush=True)
 
         # 9. Texture baking — masks gate which photo pixels contribute
         out_dir = work / "out"
