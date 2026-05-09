@@ -1,0 +1,31 @@
+# RunPod serverless framework
+runpod>=1.7.0
+
+# Core scientific stack
+numpy>=1.26,<2.0
+scipy>=1.11
+opencv-python-headless>=4.9
+Pillow>=10.0
+pillow-heif>=0.16
+imageio>=2.34
+tqdm>=4.66
+plyfile>=1.0
+trimesh>=4.4
+einops>=0.7
+
+# HuggingFace stack (Depth Anything v2, etc.)
+transformers>=4.42
+accelerate>=0.30
+huggingface-hub>=0.24
+safetensors>=0.4
+
+# 3DGS / 2DGS dependencies
+plyfile>=1.0
+matplotlib>=3.7
+
+# Mesh processing
+pymeshlab>=2023.12
+
+# Misc
+pyyaml>=6.0
+omegaconf>=2.3
