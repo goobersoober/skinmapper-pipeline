@@ -76,7 +76,8 @@ def delight_texture(tex_bgr: np.ndarray) -> np.ndarray:
 
 
 def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
-                  tex_size: int = 4096) -> Dict[str, Path]:
+                  tex_size: int = 4096,
+                  mask_dir: Path | None = None) -> Dict[str, Path]:
     """
     Convert 2DGS fused mesh → OBJ with UV atlas, bake texture by projecting
     source photos. Returns paths to {original, albedo, mesh}.
@@ -111,29 +112,18 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
     tex_orig = out_dir / "mesh_original.png"
     tex_albedo = out_dir / "mesh_albedo.png"
 
-    # Save raster registration for pymeshlab projection.
-    # 2DGS images.txt + cameras.txt under workdir/sparse/0 — pymeshlab needs
-    # them in its own .out / Bundler format. We sidestep by using the
-    # 2DGS render.py to bake views, then projecting in CV space.
-    #
-    # Concretely: render the trained model from each input camera, then
-    # blend that view into the texture via UV projection. Implemented
-    # below as project_views_to_texture().
-    rendered_dir = workdir / "rendered_views"
-    if not rendered_dir.exists():
-        rendered_dir.mkdir()
-        _render_all_views(workdir, rendered_dir)
-
-    # Save the OBJ first (so we have UVs)
+    # Save the OBJ first (so its UVs are available for projection)
     ms.save_current_mesh(str(obj_path),
                          save_textures=False,
                          save_vertex_color=False)
 
-    # Project source photos to texture
+    # Project source photos to texture (use SAM 2 masks to discount
+    # background pixels — only limb pixels contribute to the bake)
     tex = project_views_to_texture(
         obj_path=obj_path,
         workdir=workdir,
         tex_size=tex_size,
+        mask_dir=mask_dir,
     )
     cv2.imwrite(str(tex_orig), tex)
     cv2.imwrite(str(tex_albedo), delight_texture(tex))
@@ -159,39 +149,74 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
             "mtl": mtl_path}
 
 
-def _render_all_views(workdir: Path, out_dir: Path) -> None:
-    """Render trained model from each training-set camera (used as sanity)."""
-    # Stub — pymeshlab's projection actually doesn't need this. Kept as
-    # a hook for future GS-IR / per-view albedo extraction.
-    return
-
-
 def project_views_to_texture(obj_path: Path, workdir: Path,
-                             tex_size: int = 4096) -> np.ndarray:
+                             tex_size: int = 4096,
+                             mask_dir: Path | None = None) -> np.ndarray:
     """
-    Photo-projection texture baking.
+    Photo-projection texture baking — vectorised, GPU-friendly.
 
-    For each input photo, compute which OBJ triangles project into the photo
-    (using the COLMAP poses we wrote), then back-project pixels into the UV
-    atlas and accumulate a weighted average (weighted by view angle and
-    inverse depth — i.e. prefer fronto-parallel, close-up views).
+    Strategy: render the UV atlas to find which texel maps to which 3D point,
+    then for each input photo, project all those 3D points into the photo
+    in one matrix multiply. No per-face Python loop.
 
-    Returns BGR uint8 texture of shape (tex_size, tex_size, 3).
+    Steps:
+      1. Build a UV→3D lookup grid:
+         For each texel (u, v), find which face it falls inside, compute
+         the barycentric coords, and write the world-space 3D point and
+         normal at that texel. (This is "rasterise the atlas".)
+      2. For each photo:
+         - Project the entire 3D point grid into the photo (one mat-mul).
+         - Compute view angle and visibility.
+         - Sample photo pixels at projected coords (cv2.remap is bilinear).
+         - Accumulate into the texture with view-angle weighting.
+
+    Returns BGR uint8 (tex_size, tex_size, 3).
     """
     import trimesh
 
     mesh = trimesh.load(str(obj_path), process=False)
-    verts = np.asarray(mesh.vertices)        # (V, 3)
-    faces = np.asarray(mesh.faces)           # (F, 3)
-    uvs   = np.asarray(mesh.visual.uv)       # (V, 2)  ← per-vertex UVs
+    verts = np.asarray(mesh.vertices, dtype=np.float64)        # (V, 3)
+    faces = np.asarray(mesh.faces, dtype=np.int64)             # (F, 3)
+    if getattr(mesh.visual, "uv", None) is None:
+        raise RuntimeError(
+            f"OBJ at {obj_path} has no UV coordinates — pymeshlab "
+            "parametrisation step must have failed silently"
+        )
+    uvs = np.asarray(mesh.visual.uv, dtype=np.float64)         # (V, 2)
+    if len(uvs) != len(verts):
+        raise RuntimeError(
+            f"UV/vertex count mismatch: {len(uvs)} UVs vs {len(verts)} verts"
+        )
+
+    # Step 1: rasterise UV atlas → per-texel (3D point, face_index)
+    pos_map, face_map = _rasterise_uv_atlas(verts, faces, uvs, tex_size)
+    # pos_map: (S, S, 3) world coords, NaN where uncovered
+    # face_map: (S, S) int64 face indices, -1 where uncovered
+
+    # Per-face normal (lazy; only used for view-angle weighting)
+    f_v0 = verts[faces[:, 0]]
+    f_v1 = verts[faces[:, 1]]
+    f_v2 = verts[faces[:, 2]]
+    f_n  = np.cross(f_v1 - f_v0, f_v2 - f_v0)
+    f_n /= (np.linalg.norm(f_n, axis=1, keepdims=True) + 1e-8)
+    # Lookup normal per texel
+    face_idx = face_map.copy()
+    face_idx[face_idx < 0] = 0
+    nrm_map = f_n[face_idx]
+    nrm_map[face_map < 0] = 0  # mask out
 
     # Read cameras + poses
     sparse = workdir / "sparse" / "0"
     cams = _read_cameras(sparse / "cameras.txt")
     imgs = _read_images(sparse / "images.txt")
 
-    accum = np.zeros((tex_size, tex_size, 3), dtype=np.float64)
-    weight = np.zeros((tex_size, tex_size), dtype=np.float64)
+    accum  = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+    weight = np.zeros((tex_size, tex_size),    dtype=np.float32)
+
+    valid_mask = (face_map >= 0)
+    pos_flat = pos_map.reshape(-1, 3)
+    nrm_flat = nrm_map.reshape(-1, 3)
+    H_W = tex_size * tex_size
 
     img_dir = workdir / "images"
     for img_id, info in imgs.items():
@@ -201,56 +226,162 @@ def project_views_to_texture(obj_path: Path, workdir: Path,
             continue
         h, w = photo.shape[:2]
 
-        # Build world->cam (R, t) from quaternion in COLMAP convention
+        # Optional: mask the photo so masked regions contribute zero
+        photo_mask = None
+        if mask_dir is not None:
+            mp = mask_dir / (Path(info["name"]).stem + ".png")
+            if mp.exists():
+                photo_mask = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
+                if photo_mask is not None and photo_mask.shape != photo.shape[:2]:
+                    photo_mask = cv2.resize(photo_mask, (w, h),
+                                            interpolation=cv2.INTER_NEAREST)
+
         qw, qx, qy, qz = info["qvec"]
         R = _quat_to_rot(qw, qx, qy, qz)
-        t = np.array(info["tvec"])
-        # Project verts
-        cam_pts = (R @ verts.T).T + t  # (V, 3) in cam frame
+        t = np.array(info["tvec"], dtype=np.float64)
+
+        # Project all texel points: (N, 3) @ R.T + t  →  cam frame
+        # Vectorised: cam_pts = pos_flat @ R.T + t
+        cam_pts = pos_flat @ R.T + t  # (N, 3)
         z = cam_pts[:, 2]
-        valid = z > 0.01
+
         K = np.array([[cam["fx"], 0, cam["cx"]],
                       [0, cam["fy"], cam["cy"]],
-                      [0, 0, 1]])
-        proj = (K @ cam_pts.T).T
-        proj = proj[:, :2] / np.clip(proj[:, 2:3], 1e-6, None)
+                      [0, 0, 1]], dtype=np.float64)
+        # Project
+        proj = cam_pts @ K.T
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u_px = proj[:, 0] / proj[:, 2]
+            v_px = proj[:, 1] / proj[:, 2]
 
-        for f in faces:
-            if not (valid[f].all()):
-                continue
-            uv0, uv1, uv2 = uvs[f]
-            p0, p1, p2 = proj[f]
-            if not _all_in_image(p0, p1, p2, w, h):
-                continue
+        # In-bounds + in-front mask
+        inb = (z > 0.01) & (u_px >= 0) & (u_px < w - 1) & \
+              (v_px >= 0) & (v_px < h - 1) & valid_mask.reshape(-1)
 
-            # View weight: face normal · -view dir  (favour fronto-parallel)
-            v0, v1, v2 = cam_pts[f]
-            n = np.cross(v1 - v0, v2 - v0)
-            nn = np.linalg.norm(n)
-            if nn < 1e-8:
-                continue
-            n /= nn
-            view = (v0 + v1 + v2) / 3.0
-            view /= np.linalg.norm(view) + 1e-8
-            cos_v = max(0.0, -float(np.dot(n, view)))
-            if cos_v < 0.15:
-                continue
-            weight_val = cos_v ** 2
+        if not inb.any():
+            continue
 
-            _splat_face(accum, weight, photo,
-                        uv0, uv1, uv2, p0, p1, p2,
-                        tex_size, weight_val)
+        # View-angle weight: angle between face normal and view direction
+        view = cam_pts / (np.linalg.norm(cam_pts, axis=1, keepdims=True) + 1e-8)
+        # face normals are in WORLD frame; rotate to cam frame: n_cam = R @ n_world
+        n_cam = nrm_flat @ R.T
+        cos_v = -(n_cam * view).sum(axis=1)  # +ve when facing camera
+        cos_v = np.clip(cos_v, 0, 1)
+        # Lower threshold: 0.15 ≈ 81° from normal (very grazing) → reject
+        inb &= (cos_v > 0.15)
+        if not inb.any():
+            continue
 
-    weight = np.maximum(weight, 1e-6)
-    out = (accum / weight[:, :, None]).clip(0, 255).astype(np.uint8)
+        # Sample photo at projected coords (bilinear via cv2.remap)
+        map_x = np.full((tex_size, tex_size), -1, dtype=np.float32)
+        map_y = np.full((tex_size, tex_size), -1, dtype=np.float32)
+        map_x.flat[inb] = u_px[inb].astype(np.float32)
+        map_y.flat[inb] = v_px[inb].astype(np.float32)
 
-    # Inpaint uncovered regions only near the boundary of covered ones
+        sampled = cv2.remap(photo, map_x, map_y,
+                            interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=(0, 0, 0))
+
+        w_tex = np.zeros(tex_size * tex_size, dtype=np.float32)
+        w_tex[inb] = (cos_v[inb] ** 2).astype(np.float32)
+
+        if photo_mask is not None:
+            # Zero-out weight where the photo's own mask says background
+            # (uses sampled mask via the same remap)
+            mask_remap = cv2.remap(
+                photo_mask, map_x, map_y,
+                interpolation=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+            w_tex *= (mask_remap.flatten() > 127).astype(np.float32)
+
+        w_tex2d = w_tex.reshape(tex_size, tex_size)
+        accum += sampled.astype(np.float32) * w_tex2d[..., None]
+        weight += w_tex2d
+
+    weight_safe = np.maximum(weight, 1e-6)
+    out = (accum / weight_safe[..., None]).clip(0, 255).astype(np.uint8)
+
+    # Inpaint near the boundary of covered regions only — never invent
+    # interior detail
     cov = (weight > 1e-3).astype(np.uint8) * 255
     border = cv2.dilate(cov, np.ones((21, 21), np.uint8)) - cov
     inp_mask = (border > 0).astype(np.uint8)
     out = cv2.inpaint(out, inp_mask, 3, cv2.INPAINT_TELEA)
 
     return out
+
+
+# ---------- UV atlas rasterisation (helper) ----------
+
+def _rasterise_uv_atlas(verts: np.ndarray, faces: np.ndarray, uvs: np.ndarray,
+                        tex_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    For each texel, find which 3D world-space point it represents.
+
+    Returns:
+        pos_map  : (tex_size, tex_size, 3) — world-space point at each texel
+                   (zeros where no face covers that texel)
+        face_map : (tex_size, tex_size)    — face index (-1 if uncovered)
+
+    Uses cv2.fillConvexPoly with sub-pixel barycentric interpolation.
+    """
+    pos_map = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+    face_map = -np.ones((tex_size, tex_size), dtype=np.int64)
+
+    for fi, f in enumerate(faces):
+        v0, v1, v2 = verts[f]
+        uv0, uv1, uv2 = uvs[f]
+        # UV px (note: V flipped — UVs are bottom-origin, image top-origin)
+        p = np.array([
+            [uv0[0] * tex_size, (1 - uv0[1]) * tex_size],
+            [uv1[0] * tex_size, (1 - uv1[1]) * tex_size],
+            [uv2[0] * tex_size, (1 - uv2[1]) * tex_size],
+        ])
+        x_min = max(0, int(np.floor(p[:, 0].min())))
+        x_max = min(tex_size - 1, int(np.ceil(p[:, 0].max())))
+        y_min = max(0, int(np.floor(p[:, 1].min())))
+        y_max = min(tex_size - 1, int(np.ceil(p[:, 1].max())))
+        if x_max <= x_min or y_max <= y_min:
+            continue
+
+        # Barycentric basis
+        v0_uv = p[1] - p[0]
+        v1_uv = p[2] - p[0]
+        d00 = v0_uv @ v0_uv
+        d01 = v0_uv @ v1_uv
+        d11 = v1_uv @ v1_uv
+        denom = d00 * d11 - d01 * d01
+        if abs(denom) < 1e-9:
+            continue
+
+        ys, xs = np.mgrid[y_min:y_max + 1, x_min:x_max + 1]
+        pts = np.stack([xs, ys], axis=-1).astype(np.float32) - p[0]
+        d20 = pts @ v0_uv
+        d21 = pts @ v1_uv
+        v = (d11 * d20 - d01 * d21) / denom
+        w = (d00 * d21 - d01 * d20) / denom
+        u = 1 - v - w
+        inside = (u >= 0) & (v >= 0) & (w >= 0)
+        if not inside.any():
+            continue
+
+        # Interpolate world position
+        u_in = u[inside][..., None]
+        v_in = v[inside][..., None]
+        w_in = w[inside][..., None]
+        pos = u_in * v0 + v_in * v1 + w_in * v2
+
+        ys_in = ys[inside]
+        xs_in = xs[inside]
+        # Only write if not already written (atlas should be disjoint)
+        empty = face_map[ys_in, xs_in] < 0
+        ys_e, xs_e = ys_in[empty], xs_in[empty]
+        pos_map[ys_e, xs_e] = pos[empty].astype(np.float32)
+        face_map[ys_e, xs_e] = fi
+
+    return pos_map, face_map
 
 
 # ---------- COLMAP I/O helpers ----------
@@ -300,67 +431,5 @@ def _quat_to_rot(qw, qx, qy, qz) -> np.ndarray:
     ])
 
 
-def _all_in_image(p0, p1, p2, w, h) -> bool:
-    for p in (p0, p1, p2):
-        if p[0] < 0 or p[1] < 0 or p[0] >= w or p[1] >= h:
-            return False
-    return True
-
-
-def _splat_face(accum, weight, photo,
-                uv0, uv1, uv2, p0, p1, p2,
-                tex_size, w_val) -> None:
-    """
-    Rasterise the triangle in UV space and pull RGB from the image at each
-    UV pixel (barycentric-interpolated image coords).
-    """
-    uv_px = np.array([
-        [uv0[0] * tex_size, (1 - uv0[1]) * tex_size],
-        [uv1[0] * tex_size, (1 - uv1[1]) * tex_size],
-        [uv2[0] * tex_size, (1 - uv2[1]) * tex_size],
-    ])
-    x_min = max(0, int(np.floor(uv_px[:, 0].min())))
-    x_max = min(tex_size - 1, int(np.ceil(uv_px[:, 0].max())))
-    y_min = max(0, int(np.floor(uv_px[:, 1].min())))
-    y_max = min(tex_size - 1, int(np.ceil(uv_px[:, 1].max())))
-    if x_max <= x_min or y_max <= y_min:
-        return
-
-    # Barycentric setup
-    v0 = uv_px[1] - uv_px[0]
-    v1 = uv_px[2] - uv_px[0]
-    d00 = v0 @ v0
-    d01 = v0 @ v1
-    d11 = v1 @ v1
-    denom = d00 * d11 - d01 * d01
-    if abs(denom) < 1e-9:
-        return
-
-    ys, xs = np.mgrid[y_min:y_max + 1, x_min:x_max + 1]
-    pts = np.stack([xs, ys], axis=-1).reshape(-1, 2).astype(np.float32)
-    v2_ = pts - uv_px[0]
-    d20 = v2_ @ v0
-    d21 = v2_ @ v1
-    v = (d11 * d20 - d01 * d21) / denom
-    w_ = (d00 * d21 - d01 * d20) / denom
-    u = 1 - v - w_
-    inside = (u >= 0) & (v >= 0) & (w_ >= 0)
-    if not inside.any():
-        return
-    u, v, w_ = u[inside], v[inside], w_[inside]
-    pts_in = pts[inside].astype(int)
-
-    # Image coords for those UV pixels
-    img_xy = (u[:, None] * p0 + v[:, None] * p1 + w_[:, None] * p2)
-    img_xy = img_xy.astype(int)
-    h_img, w_img = photo.shape[:2]
-    ok = (img_xy[:, 0] >= 0) & (img_xy[:, 0] < w_img) & \
-         (img_xy[:, 1] >= 0) & (img_xy[:, 1] < h_img)
-    if not ok.any():
-        return
-    pts_in = pts_in[ok]
-    img_xy = img_xy[ok]
-
-    bgr = photo[img_xy[:, 1], img_xy[:, 0]].astype(np.float64)
-    accum[pts_in[:, 1], pts_in[:, 0]] += bgr * w_val
-    weight[pts_in[:, 1], pts_in[:, 0]] += w_val
+# (legacy per-face splat helpers removed — replaced by vectorised
+# project_views_to_texture above)

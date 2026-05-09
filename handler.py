@@ -82,16 +82,27 @@ def _unzip(zip_path: Path, dst: Path) -> None:
 
 # -------- core pipeline --------
 
+def _step(label: str, t_prev: list[float]):
+    """Log elapsed time since the previous step and reset the marker."""
+    now = time.time()
+    elapsed = now - t_prev[0]
+    print(f"[step] {label}  (+{elapsed:.1f}s)", flush=True)
+    t_prev[0] = now
+
+
 def run_pipeline(job_input: dict) -> dict:
     t0 = time.time()
+    t_step = [t0]
     stats: dict = {}
 
     scan_type = job_input.get("scan_type", "design")
     body_part = job_input.get("body_part", "leg")
-    iterations = int(job_input.get("iterations", 10_000))
+    iterations = int(job_input.get("iterations", 15_000))
 
     work = make_workdir()
     print(f"[pipe] workdir = {work}", flush=True)
+    print(f"[pipe] scan_type={scan_type} body_part={body_part} "
+          f"iterations={iterations}", flush=True)
 
     try:
         # 1. Get photos
@@ -118,6 +129,7 @@ def run_pipeline(job_input: dict) -> dict:
         if len(photos) < 15:
             raise ValueError(f"need at least 15 photos, got {len(photos)}")
         stats["photos_input"] = len(photos)
+        _step(f"unzip — {len(photos)} photos", t_step)
 
         # 2. Blur rejection
         kept, rejected = reject_blurry(photos, threshold=60.0)
@@ -125,43 +137,66 @@ def run_pipeline(job_input: dict) -> dict:
         if len(kept) < 15:
             print(f"[pre] blur threshold too aggressive — keeping all", flush=True)
             kept = photos
-        # 3. Normalise to JPEGs
+
+        # 3. Normalise to JPEGs (HEIC→JPEG, downsize to ≤1600px)
         jpeg_dir = work / "jpegs"
         kept_jpegs = normalise_to_jpeg(kept, jpeg_dir, max_dim=1600)
         stats["photos_used"] = len(kept_jpegs)
-        print(f"[pre] {len(kept_jpegs)} photos after blur+normalise", flush=True)
+        _step(f"preprocess — {len(kept_jpegs)} JPEGs ready "
+              f"({len(rejected)} blur-rejected)", t_step)
 
-        # 4. SAM 2 segmentation
+        # 4. SAM 2 segmentation — produces binary masks (and a masked preview).
+        # CRITICAL: masks are NOT applied before pose estimation. MASt3R needs
+        # full visual context (including background features) to triangulate
+        # camera positions reliably on low-texture skin. Masks are used later
+        # to constrain 2DGS training and to bound the depth-prior point cloud.
         mask_dir   = work / "masks"
-        masked_dir = work / "masked"
-        seg_stats = segment_folder(jpeg_dir, mask_dir, masked_dir, body_part=body_part)
+        masked_dir = work / "masked"   # preview only; not used for matching
+        seg_stats = segment_folder(jpeg_dir, mask_dir, masked_dir,
+                                   body_part=body_part)
         stats["segmentation"] = seg_stats
-        print(f"[seg] {seg_stats}", flush=True)
+        _step(f"SAM 2 — {seg_stats}", t_step)
 
-        # 5. Depth Anything v2 priors
+        # 5. Depth Anything v2 priors — masked to limb only
         depth_dir = work / "depths"
         n_depth = estimate_depth_folder(jpeg_dir, depth_dir, mask_dir=mask_dir)
         stats["depth_maps"] = n_depth
+        _step(f"Depth Anything v2 — {n_depth} maps", t_step)
 
-        # 6. MASt3R poses (use masked images so background can't drive matching)
-        masked_paths = sorted(masked_dir.iterdir())
-        pose_stats = estimate_poses(masked_paths, work)
+        # 6. MASt3R poses on the ORIGINAL JPEGs (backgrounds intact)
+        jpeg_paths = sorted(p for p in jpeg_dir.iterdir()
+                            if p.suffix.lower() in {".jpg", ".jpeg"})
+        pose_stats = estimate_poses(jpeg_paths, work)
         stats["pose"] = pose_stats
-        print(f"[pose] {pose_stats}", flush=True)
+        _step(f"MASt3R poses — {pose_stats}", t_step)
+
+        # 6b. Densify points3D.txt with depth-prior projection.
+        from pipeline.pose import densify_points_with_depth
+        densify_stats = densify_points_with_depth(
+            workdir=work, depth_dir=depth_dir, mask_dir=mask_dir,
+            jpeg_paths=jpeg_paths, samples_per_view=8000,
+        )
+        stats["depth_densify"] = densify_stats
+        _step(f"Depth-init densify — {densify_stats}", t_step)
 
         # 7. 2DGS training
         ply = train_2dgs(work, iterations=iterations,
                          normal_loss_weight=0.10,
+                         distortion_loss_weight=1000.0,
                          depth_dir=depth_dir)
         stats["trained_ply"] = str(ply)
+        _step(f"2DGS training — {iterations} iters", t_step)
 
         # 8. Mesh extraction
         model_dir = work / "output"
         mesh_ply = extract_mesh(work, model_dir)
+        _step(f"mesh extraction — {mesh_ply.name}", t_step)
 
-        # 9. Texture baking
+        # 9. Texture baking — masks gate which photo pixels contribute
         out_dir = work / "out"
-        artefacts = bake_textures(mesh_ply, work, out_dir, tex_size=4096)
+        artefacts = bake_textures(mesh_ply, work, out_dir,
+                                  tex_size=4096, mask_dir=mask_dir)
+        _step(f"texture baking — {len(artefacts)} artefacts", t_step)
 
         # 10. Pick texture(s) by scan_type
         keep_original = scan_type in ("content", "post_tattoo", "both")

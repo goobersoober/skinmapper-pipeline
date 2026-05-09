@@ -67,13 +67,26 @@ class LimbSegmenter:
         if self._gdino is not None:
             return self._gdino
         from groundingdino.util.inference import load_model
-        config_path = "/workspace/sam2/.."  # GroundingDINO ships its own config
-        # Use the python-package shipped config
         import groundingdino
+
+        # GroundingDINO config can live at slightly different paths depending
+        # on whether it was installed via `groundingdino-py` (PyPI) or built
+        # from source. Try both.
         gdino_root = Path(groundingdino.__file__).parent
-        cfg = gdino_root / "config" / "GroundingDINO_SwinT_OGC.py"
+        candidates = [
+            gdino_root / "config" / "GroundingDINO_SwinT_OGC.py",
+            gdino_root.parent / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py",
+            Path("/tmp/gdino/groundingdino/config/GroundingDINO_SwinT_OGC.py"),
+        ]
+        cfg_path = next((c for c in candidates if c.exists()), None)
+        if cfg_path is None:
+            raise FileNotFoundError(
+                f"GroundingDINO config not found. Searched: {candidates}"
+            )
         ckpt = "/workspace/checkpoints/groundingdino_swint_ogc.pth"
-        self._gdino = load_model(str(cfg), ckpt)
+        if not Path(ckpt).exists():
+            raise FileNotFoundError(f"GroundingDINO checkpoint missing: {ckpt}")
+        self._gdino = load_model(str(cfg_path), ckpt)
         self._gdino.to(self.device)
         return self._gdino
 
