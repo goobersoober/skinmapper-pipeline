@@ -57,10 +57,21 @@ RUN cd /workspace/2dgs && \
 
 # --- MASt3R (pose estimation) ---
 # https://github.com/naver/mast3r
-RUN git clone --recursive https://github.com/naver/mast3r.git /workspace/mast3r && \
-    cd /workspace/mast3r && \
-    pip install -r requirements.txt && \
-    cd dust3r && pip install -r requirements.txt
+# Use --no-build-isolation for any deps that build CUDA extensions
+# (RoPE, croco, etc.) so they can find the pre-installed torch.
+RUN git clone --recursive https://github.com/naver/mast3r.git /workspace/mast3r
+
+RUN cd /workspace/mast3r && \
+    pip install --no-build-isolation -r requirements.txt
+
+RUN cd /workspace/mast3r/dust3r && \
+    pip install --no-build-isolation -r requirements.txt
+
+# DUSt3R's optional CUDA-accelerated RoPE — if it fails to build, fall back
+# to the pure-Python implementation (slower but works)
+RUN cd /workspace/mast3r/dust3r/croco/models/curope && \
+    python setup.py build_ext --inplace || \
+    echo "[warn] cuRoPE build failed — using pure-Python RoPE (slower)"
 
 # MASt3R checkpoint
 RUN mkdir -p /workspace/mast3r/checkpoints && \
@@ -69,21 +80,24 @@ RUN mkdir -p /workspace/mast3r/checkpoints && \
       https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
 
 # --- SAM 2 ---
-# Needs full git history (no --depth 1) for some build hooks.
-RUN git clone https://github.com/facebookresearch/sam2.git /workspace/sam2 && \
-    cd /workspace/sam2 && \
-    pip install -e . && \
-    mkdir -p checkpoints && \
-    wget --tries=3 --timeout=30 -q -O checkpoints/sam2.1_hiera_large.pt \
+# `pip install -e .` builds a CUDA extension — needs --no-build-isolation
+# so it sees torch.
+RUN git clone https://github.com/facebookresearch/sam2.git /workspace/sam2
+
+RUN cd /workspace/sam2 && \
+    pip install --no-build-isolation -e .
+
+RUN mkdir -p /workspace/sam2/checkpoints && \
+    wget --tries=3 --timeout=30 -q -O \
+      /workspace/sam2/checkpoints/sam2.1_hiera_large.pt \
       https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
 
 # --- GroundingDINO (text-prompted detector that pairs with SAM 2) ---
-# The PyPI package `groundingdino-py` ships pre-built CUDA ops and the
-# config files we need. Falls back to source install if the wheel doesn't
-# match the torch ABI in this image.
-RUN pip install groundingdino-py || \
+# Try the PyPI wheel first (no CUDA build needed). If the ABI is incompatible,
+# fall back to source install with --no-build-isolation.
+RUN pip install --no-build-isolation groundingdino-py || \
     (git clone https://github.com/IDEA-Research/GroundingDINO.git /tmp/gdino && \
-     cd /tmp/gdino && pip install -e . && cd /workspace)
+     cd /tmp/gdino && pip install --no-build-isolation -e .)
 
 # GroundingDINO checkpoint
 RUN mkdir -p /workspace/checkpoints && \
