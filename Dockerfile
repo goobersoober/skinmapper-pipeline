@@ -34,13 +34,26 @@ RUN pip install --upgrade pip setuptools wheel && \
 
 # --- 2D Gaussian Splatting (with CUDA submodules) ---
 # https://github.com/hbb1/2d-gaussian-splatting
-# diff-surfel-rasterization needs the matching torch headers. The base image
-# already has torch 2.4 + CUDA 12.4 toolkit — submodule build should succeed.
-RUN git clone https://github.com/hbb1/2d-gaussian-splatting.git /workspace/2dgs && \
-    cd /workspace/2dgs && \
-    git submodule update --init --recursive && \
-    pip install ./submodules/diff-surfel-rasterization && \
-    pip install ./submodules/simple-knn
+# Split into discrete RUN steps so build logs pinpoint which step failed.
+# diff-surfel-rasterization compiles against torch headers — needs nvcc
+# from the 'devel' base image (already provided).
+RUN git clone https://github.com/hbb1/2d-gaussian-splatting.git /workspace/2dgs
+
+RUN cd /workspace/2dgs && git submodule update --init --recursive
+
+# Print the build env up-front so any compile error is reproducible
+RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda); \
+    import sys; print('python', sys.version)" && \
+    nvcc --version && \
+    which gcc && gcc --version | head -1
+
+# These two CUDA extensions are where most build failures happen.
+# Each gets its own RUN so the log shows which one failed.
+RUN cd /workspace/2dgs && \
+    pip install --no-build-isolation ./submodules/diff-surfel-rasterization
+
+RUN cd /workspace/2dgs && \
+    pip install --no-build-isolation ./submodules/simple-knn
 
 # --- MASt3R (pose estimation) ---
 # https://github.com/naver/mast3r
