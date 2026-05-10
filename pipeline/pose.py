@@ -49,9 +49,10 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
     #   negligible quality loss for orbit-style limb captures (each frame's
     #   meaningful overlap is with its temporal neighbours).
     n = len(images)
-    k = min(10, max(3, n - 1))
+    # k=5 keeps pairs ~5·N — enough overlap for good registration while
+    # staying well within 24 GB VRAM for 80-photo captures.
+    k = min(5, max(3, n - 1))
     if n <= 16:
-        # Few enough photos that complete graph is cheap and more accurate
         pairs = make_pairs(images, scene_graph="complete",
                           prefilter=None, symmetrize=True)
     else:
@@ -60,7 +61,32 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
     print(f"[pose] {n} images → {len(pairs)} pairs "
           f"(strategy={'complete' if n <= 16 else f'swin-{k}'})", flush=True)
 
-    output = inference(pairs, model, device, batch_size=1, verbose=False)
+    # Run inference in chunks to avoid OOM on large captures.
+    # Each chunk's results are moved to CPU before the next chunk runs.
+    CHUNK = 64
+    all_view1, all_view2, all_pred1, all_pred2 = [], [], [], []
+    for i in range(0, len(pairs), CHUNK):
+        chunk = pairs[i:i + CHUNK]
+        out = inference(chunk, model, device, batch_size=1, verbose=False)
+        # Move tensors to CPU immediately to free VRAM
+        def _to_cpu(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu()
+            return x
+        all_view1.extend(out["view1"] if isinstance(out["view1"], list)
+                         else [out["view1"]])
+        all_view2.extend(out["view2"] if isinstance(out["view2"], list)
+                         else [out["view2"]])
+        all_pred1.extend(out["pred1"] if isinstance(out["pred1"], list)
+                         else [out["pred1"]])
+        all_pred2.extend(out["pred2"] if isinstance(out["pred2"], list)
+                         else [out["pred2"]])
+        torch.cuda.empty_cache()
+        print(f"[pose] inference {min(i+CHUNK, len(pairs))}/{len(pairs)} pairs",
+              flush=True)
+
+    output = {"view1": all_view1, "view2": all_view2,
+               "pred1": all_pred1, "pred2": all_pred2}
 
     scene = global_aligner(output, device=device,
                            mode=GlobalAlignerMode.PointCloudOptimizer)
