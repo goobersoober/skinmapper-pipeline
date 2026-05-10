@@ -107,15 +107,21 @@ RUN python -c "from transformers import AutoModelForDepthEstimation, AutoImagePr
     AutoImageProcessor.from_pretrained(name); \
     AutoModelForDepthEstimation.from_pretrained(name)"
 
-# --- Pipeline code (last layer — quick rebuilds when only code changes) ---
-COPY pipeline /workspace/pipeline
-COPY handler.py /workspace/handler.py
+# --- Pipeline code: cloned once at build, pulled fresh at each job start ---
+# This means code changes (handler.py, pipeline/*.py) deploy instantly —
+# just push to GitHub. No Docker rebuild or rollout needed.
+RUN git clone https://github.com/goobersoober/skinmapper-pipeline.git \
+      /workspace/skinmapper-pipeline
 
-ENV PYTHONPATH="/workspace:/workspace/2dgs:/workspace/mast3r:/workspace/mast3r/dust3r:/workspace/sam2"
+ENV PYTHONPATH="/workspace/skinmapper-pipeline:/workspace/2dgs:/workspace/mast3r:/workspace/mast3r/dust3r:/workspace/sam2"
 
 RUN python -c "import torch; assert torch.cuda.is_available() or True; \
     import runpod; \
     from transformers import AutoModelForDepthEstimation; \
     print('image OK — torch', torch.__version__, 'cuda', torch.version.cuda)"
 
-CMD ["python", "-u", "/workspace/handler.py"]
+# start.sh: pulls latest code then launches handler — runs on every job start
+COPY start.sh /workspace/start.sh
+RUN chmod +x /workspace/start.sh
+
+CMD ["/workspace/start.sh"]
