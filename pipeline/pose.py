@@ -34,7 +34,6 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
     Returns: { 'n_registered': int, 'n_points': int }
     """
     from mast3r.model import AsymmetricMASt3R
-    from mast3r.utils.coarse_to_fine import coarse_matching
     from dust3r.image_pairs import make_pairs
     from dust3r.inference import inference
     from dust3r.utils.image import load_images
