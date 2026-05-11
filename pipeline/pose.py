@@ -39,51 +39,72 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
     from dust3r.utils.image import load_images
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 
-    ckpt = "/workspace/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
-    model = AsymmetricMASt3R.from_pretrained(ckpt).to(device).eval()
+    from pipeline.pair_select import (compute_dinov2_embeddings,
+                                       top_k_pairs, make_retrieval_pairs)
 
     images = load_images([str(p) for p in image_paths], size=512)
-    # Pair selection strategy:
-    #   complete graph is O(N²) — 78 photos = 6006 pairs ≈ 50 min on RTX 4090.
-    #   Use sliding-window of k=10 instead → ≤ 10·N pairs ≈ 8× faster, with
-    #   negligible quality loss for orbit-style limb captures (each frame's
-    #   meaningful overlap is with its temporal neighbours).
     n = len(images)
-    # k=5 keeps pairs ~5·N — enough overlap for good registration while
-    # staying well within 24 GB VRAM for 80-photo captures.
-    k = min(5, max(3, n - 1))
+
+    # Pair selection — same approach Polycam/KIRI use:
+    #   1. Compute DINOv2 global feature per image
+    #   2. For each image, take its top-k most similar images by cosine sim
+    # This catches close-up + wide pairs of the same area regardless of
+    # capture order, unlike a temporal sliding window.
     if n <= 16:
         pairs = make_pairs(images, scene_graph="complete",
                           prefilter=None, symmetrize=True)
+        strategy = "complete"
     else:
-        pairs = make_pairs(images, scene_graph=f"swin-{k}",
-                          prefilter=None, symmetrize=True)
-    print(f"[pose] {n} images → {len(pairs)} pairs "
-          f"(strategy={'complete' if n <= 16 else f'swin-{k}'})", flush=True)
+        print(f"[pose] computing DINOv2 embeddings for {n} images...",
+              flush=True)
+        embeddings = compute_dinov2_embeddings(image_paths, device=device)
+        k = 12
+        pair_idx = top_k_pairs(embeddings, k=k)
+        pairs = make_retrieval_pairs(images, pair_idx, symmetrize=True)
+        strategy = f"dinov2-top{k}"
 
-    # Run inference in chunks to avoid OOM on large captures.
-    # Each chunk's results are moved to CPU before the next chunk runs.
-    CHUNK = 64
+    print(f"[pose] {n} images → {len(pairs)} pairs (strategy={strategy})",
+          flush=True)
+
+    # Load MASt3R AFTER DINOv2 has been freed (lower peak VRAM)
+    ckpt = "/workspace/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+    model = AsymmetricMASt3R.from_pretrained(ckpt).to(device).eval()
+
+    # Chunked inference with graceful failure handling.
+    # If a chunk OOMs or fails, we skip it and continue — alignment can
+    # still succeed if the remaining pairs form a connected graph.
+    CHUNK = 32
     all_view1, all_view2, all_pred1, all_pred2 = [], [], [], []
+    failed = 0
     for i in range(0, len(pairs), CHUNK):
         chunk = pairs[i:i + CHUNK]
-        out = inference(chunk, model, device, batch_size=1, verbose=False)
-        # Move tensors to CPU immediately to free VRAM
-        def _to_cpu(x):
-            if isinstance(x, torch.Tensor):
-                return x.detach().cpu()
-            return x
-        all_view1.extend(out["view1"] if isinstance(out["view1"], list)
-                         else [out["view1"]])
-        all_view2.extend(out["view2"] if isinstance(out["view2"], list)
-                         else [out["view2"]])
-        all_pred1.extend(out["pred1"] if isinstance(out["pred1"], list)
-                         else [out["pred1"]])
-        all_pred2.extend(out["pred2"] if isinstance(out["pred2"], list)
-                         else [out["pred2"]])
+        try:
+            out = inference(chunk, model, device, batch_size=1, verbose=False)
+            all_view1.extend(out["view1"] if isinstance(out["view1"], list)
+                             else [out["view1"]])
+            all_view2.extend(out["view2"] if isinstance(out["view2"], list)
+                             else [out["view2"]])
+            all_pred1.extend(out["pred1"] if isinstance(out["pred1"], list)
+                             else [out["pred1"]])
+            all_pred2.extend(out["pred2"] if isinstance(out["pred2"], list)
+                             else [out["pred2"]])
+            print(f"[pose] inference {min(i+CHUNK, len(pairs))}/{len(pairs)} pairs",
+                  flush=True)
+        except Exception as e:
+            failed += len(chunk)
+            print(f"[pose] chunk {i}-{i+CHUNK} failed ({type(e).__name__}): {e}",
+                  flush=True)
         torch.cuda.empty_cache()
-        print(f"[pose] inference {min(i+CHUNK, len(pairs))}/{len(pairs)} pairs",
+
+    if failed > 0:
+        ok = len(pairs) - failed
+        print(f"[pose] {failed}/{len(pairs)} pairs failed — continuing with {ok}",
               flush=True)
+        if ok < len(pairs) * 0.5:
+            raise RuntimeError(
+                f"Too many pair failures ({failed}/{len(pairs)}) — "
+                "registration would be unreliable."
+            )
 
     output = {"view1": all_view1, "view2": all_view2,
                "pred1": all_pred1, "pred2": all_pred2}
