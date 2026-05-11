@@ -198,6 +198,33 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
     pts3d = scene.get_pts3d()                                 # list of (h, w, 3) per view
     confs = scene.get_conf()                                  # list of (h, w)
 
+    # --- Rescale scene to a normal 2DGS / TSDF working range ---
+    # MASt3R's global aligner normalises the scene to something around
+    # unit-scale, but for our close-range limb captures it lands at a
+    # bounding radius of ~0.05–0.10. 2DGS then auto-computes TSDF voxel
+    # size ≈ radius/mesh_res, which becomes ~0.0001 — smaller than any
+    # depth value, so TSDF fusion produces an empty mesh.
+    # Multiply camera translations and point positions by a single scale
+    # factor so the bounding radius lands at ~1.0. Rotations/intrinsics
+    # are unchanged; depth densification calibrates to whatever scale
+    # the COLMAP file is in, so it follows along automatically.
+    cam_centres = poses[:, :3, 3]
+    centre = cam_centres.mean(axis=0)
+    bbox_r = float(np.max(np.linalg.norm(cam_centres - centre, axis=1)))
+    TARGET_R = 1.0
+    if bbox_r < 1e-6:
+        scene_scale = 1.0
+    else:
+        scene_scale = TARGET_R / bbox_r
+    print(f"[pose] scene bounding radius {bbox_r:.4f} → "
+          f"rescaling by {scene_scale:.3f}× (target radius {TARGET_R})",
+          flush=True)
+    if abs(scene_scale - 1.0) > 1e-3:
+        # Scale camera translation columns only (rotations stay intact)
+        poses[:, :3, 3] *= scene_scale
+        # Scale 3D points (still on GPU as torch tensors)
+        pts3d = [pt * scene_scale for pt in pts3d]
+
     sparse_dir = workdir / "sparse" / "0"
     sparse_dir.mkdir(parents=True, exist_ok=True)
     images_dir = workdir / "images"
