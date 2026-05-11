@@ -42,8 +42,13 @@ def _ensure_2dgs_deps() -> None:
     if not missing:
         return
     print(f"[extract] installing missing 2DGS deps: {missing}", flush=True)
+    # --ignore-installed skips trying to uninstall system distutils packages
+    # like `blinker 1.4` that open3d pulls in as a transitive dep. Without
+    # this, the install fails on Ubuntu Python with:
+    #   "Cannot uninstall blinker 1.4 — distutils installed project"
     subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--quiet", *missing]
+        [sys.executable, "-m", "pip", "install", "--quiet",
+         "--ignore-installed", "blinker", *missing]
     )
     print(f"[extract] installed {missing}", flush=True)
 
