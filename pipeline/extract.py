@@ -154,46 +154,49 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
     _ensure_pymeshlab_system_libs()
     import pymeshlab as ml
 
+    # --- Open3D pre-decimation ---
+    # pymeshlab 2025's meshing_decimation_quadric_edge_collapse silently
+    # returns without decimating (API change?), leaving the 22M-face
+    # TSDF mesh intact. The trivial-per-wedge parametriser then can't
+    # fit ~22M triangles in any UV atlas budget. Decimate with Open3D
+    # FIRST, then hand the already-small mesh to pymeshlab.
+    import open3d as o3d  # already pulled in by _ensure_2dgs_deps above
+    o3d_mesh = o3d.io.read_triangle_mesh(str(mesh_ply))
+    n_in = len(o3d_mesh.triangles)
+    print(f"[extract] loaded mesh: {len(o3d_mesh.vertices)} verts, "
+          f"{n_in} faces", flush=True)
+    TARGET_FACES = 60_000
+    if n_in > TARGET_FACES:
+        o3d_mesh = o3d_mesh.simplify_quadric_decimation(
+            target_number_of_triangles=TARGET_FACES,
+        )
+        o3d_mesh.remove_duplicated_vertices()
+        o3d_mesh.remove_degenerate_triangles()
+        o3d_mesh.remove_unreferenced_vertices()
+        n_out = len(o3d_mesh.triangles)
+        print(f"[extract] open3d decimated: {n_in} → {n_out} faces",
+              flush=True)
+    # Write the decimated mesh to a fresh file so pymeshlab picks it up
+    decimated_ply = mesh_ply.with_name("mesh_decimated.ply")
+    o3d.io.write_triangle_mesh(str(decimated_ply), o3d_mesh)
+    del o3d_mesh
+
     ms = ml.MeshSet()
-    ms.load_new_mesh(str(mesh_ply))
-
-    # Light cleanup
-    ms.meshing_remove_duplicate_vertices()
-    ms.meshing_repair_non_manifold_edges()
-    ms.meshing_close_holes(maxholesize=80)
-
-    # Decimate to a manageable count for downstream. Lower target than we
-    # used to: the triangle-trivial-per-wedge parametriser needs UV space
-    # proportional to (face_count × border_pixels). At 120k faces with
-    # border=2 in a 4096 atlas the budget overflows ("Inter-Triangle
-    # border is too much"). 60k faces + border=1 fits comfortably and
-    # the cylindrical remap on the Mac side replaces this UV anyway.
-    ms.meshing_decimation_quadric_edge_collapse(targetfacenum=60_000,
-                                                preserveboundary=True,
-                                                preservenormal=True)
-    # Clean degenerate triangles that bloat parametrisation perimeter
-    ms.meshing_remove_null_faces()
-    ms.meshing_remove_unreferenced_vertices()
-    ms.meshing_remove_duplicate_faces()
-
-    # UV unwrap — try the cheap "trivial per wedge" first. If the
-    # mesh has weird topology that still overflows the atlas budget,
-    # fall back to LSCM (slower, but always succeeds on closed limb-shapes).
-    print(f"[extract] post-clean mesh: "
+    ms.load_new_mesh(str(decimated_ply))
+    print(f"[extract] pymeshlab loaded: "
           f"{ms.current_mesh().vertex_number()} verts, "
           f"{ms.current_mesh().face_number()} faces", flush=True)
-    try:
-        ms.compute_texcoord_parametrization_triangle_trivial_per_wedge(
-            sidedim=tex_size, textdim=tex_size, border=1,
-            method="Space-optimizing")
-    except Exception as e:
-        print(f"[extract] trivial-per-wedge UV failed ({e}) — "
-              "falling back to atlas parametrisation", flush=True)
-        # Atlas-based isometric unwrap — robust to arbitrary topology
-        ms.compute_texcoord_parametrization_and_texture_from_registered_rasters(
-            texturename="mesh_albedo.png", texturewidth=tex_size,
-            textureheight=tex_size,
-        )
+
+    # Light cleanup — these are small ops at this scale
+    ms.meshing_remove_duplicate_vertices()
+    ms.meshing_remove_null_faces()
+    ms.meshing_remove_unreferenced_vertices()
+
+    # UV unwrap. Now that we're at <100k faces with border=1 in a 4096
+    # atlas the perimeter budget is well under the texture area.
+    ms.compute_texcoord_parametrization_triangle_trivial_per_wedge(
+        sidedim=tex_size, textdim=tex_size, border=1,
+        method="Space-optimizing")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     obj_path = out_dir / "mesh.obj"
