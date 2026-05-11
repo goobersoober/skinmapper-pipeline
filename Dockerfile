@@ -1,4 +1,4 @@
-# SkinMapper neural reconstruction pipeline
+# SkinMapper neural reconstruction pipeline — build 2026-05-11
 # Base: CUDA 11.8 devel — NVCC 11.8 compiles all CUDA extensions.
 # Torch is explicitly pinned to 2.5.1+cu118 before any package install
 # so SAM 2's "torch>=2.5.1" requirement doesn't pull the latest torch
