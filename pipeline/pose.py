@@ -58,12 +58,14 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
         print(f"[pose] computing DINOv2 embeddings for {n} images...",
               flush=True)
         embeddings = compute_dinov2_embeddings(image_paths, device=device)
-        # k=8 = solid pair density (still far better than temporal swin-k).
-        # k=12 OOMs host RAM at ~pair 900 because each pair's view/pred
-        # dicts hold ~80MB of feature maps and we accumulate all of them
-        # before global_aligner runs. To raise this back to 12 we'd need
-        # to stream pair outputs to disk between chunks (TODO).
-        k = 8
+        # k=6 = pragmatic pair density. We tried k=12 (OOM during inference)
+        # and k=8 (made all 826 pairs but OOM'd at the merge step — torch.cat
+        # temporarily doubles host memory). 50GB workers can't fit the
+        # MASt3R feature maps for >700ish pairs through the merge + global
+        # aligner handoff. k=6 keeps pair count manageable while still being
+        # ~3× better than temporal swin-10. To safely raise this back to 8+
+        # we need either disk-streaming or a >100GB-RAM worker tier.
+        k = 6
         pair_idx = top_k_pairs(embeddings, k=k)
         pairs = make_retrieval_pairs(images, pair_idx, symmetrize=True)
         strategy = f"dinov2-top{k}"
@@ -135,35 +137,56 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
             )
 
     def _merge_chunk_dicts(chunks: list) -> dict:
-        """Combine a list of per-chunk dicts into one concatenated dict."""
+        """Combine a list of per-chunk dicts into one concatenated dict.
+
+        Frees each chunk's tensors as soon as they're concatenated. This
+        keeps peak host memory close to 1× original instead of 2× (which
+        is what torch.cat would do if all originals stayed referenced).
+        """
         if not chunks:
             return {}
         keys = list(chunks[0].keys())
         merged: dict = {}
-        for k in keys:
-            vals = [c[k] for c in chunks if k in c]
+        for k_name in keys:
+            # Pop each value out of the chunk dicts so the chunk_view1
+            # / etc list no longer references the per-key tensors. After
+            # torch.cat builds the merged tensor we del the per-chunk list
+            # to drop the last references.
+            vals = []
+            for c in chunks:
+                if k_name in c:
+                    vals.append(c.pop(k_name))
             if not vals:
                 continue
             first = vals[0]
             if isinstance(first, torch.Tensor):
-                merged[k] = torch.cat(vals, dim=0)
+                merged[k_name] = torch.cat(vals, dim=0)
+                del vals
             elif isinstance(first, list):
-                merged[k] = [item for sub in vals for item in sub]
+                merged[k_name] = [item for sub in vals for item in sub]
+                del vals
             elif isinstance(first, tuple):
-                # Flatten tuples too (rare)
-                merged[k] = tuple(item for sub in vals for item in sub)
+                merged[k_name] = tuple(item for sub in vals for item in sub)
+                del vals
             else:
-                # Scalar / non-collectable: just keep the first
-                merged[k] = first
+                merged[k_name] = first
+                del vals
+        chunks.clear()
         return merged
 
-    output = {
-        "view1": _merge_chunk_dicts(chunk_view1),
-        "view2": _merge_chunk_dicts(chunk_view2),
-        "pred1": _merge_chunk_dicts(chunk_pred1),
-        "pred2": _merge_chunk_dicts(chunk_pred2),
-    }
-    del chunk_view1, chunk_view2, chunk_pred1, chunk_pred2
+    import gc
+    print(f"[pose] merging {len(chunk_view1)} chunks → single dict",
+          flush=True)
+    output: dict = {}
+    output["view1"] = _merge_chunk_dicts(chunk_view1); gc.collect()
+    output["view2"] = _merge_chunk_dicts(chunk_view2); gc.collect()
+    output["pred1"] = _merge_chunk_dicts(chunk_pred1); gc.collect()
+    output["pred2"] = _merge_chunk_dicts(chunk_pred2); gc.collect()
+    print(f"[pose] merged. Starting global_aligner...", flush=True)
+    # Free MASt3R from GPU before global_aligner allocates more there
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
 
     scene = global_aligner(output, device=device,
                            mode=GlobalAlignerMode.PointCloudOptimizer)
