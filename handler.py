@@ -32,17 +32,31 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# Heartbeat prints so RunPod logs always show which import is taking time.
+# When the worker looks "hung" early on, it's usually one of these blocking.
+def _hb(label: str) -> None:
+    print(f"[boot] {time.strftime('%H:%M:%S')} {label}", flush=True)
+
+_hb("handler.py top — runpod next")
 import runpod  # type: ignore
+_hb("runpod imported — adding sys.path /workspace")
 
 sys.path.insert(0, "/workspace")
 
+_hb("importing pipeline.utils")
 from pipeline.utils    import (list_photos, normalise_to_jpeg,
                                reject_blurry, make_workdir, cleanup)
+_hb("importing pipeline.segment (SAM2 + GroundingDINO)")
 from pipeline.segment  import segment_folder
+_hb("importing pipeline.depth (Depth Anything v2)")
 from pipeline.depth    import estimate_depth_folder
+_hb("importing pipeline.pose (MASt3R + DINOv2)")
 from pipeline.pose     import estimate_poses
+_hb("importing pipeline.train (2DGS)")
 from pipeline.train    import train_2dgs
+_hb("importing pipeline.extract (mesh + textures)")
 from pipeline.extract  import extract_mesh, bake_textures
+_hb("all pipeline modules imported — ready to receive jobs")
 
 
 # -------- helpers --------
