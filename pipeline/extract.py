@@ -162,16 +162,38 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
     ms.meshing_repair_non_manifold_edges()
     ms.meshing_close_holes(maxholesize=80)
 
-    # Decimate to a manageable count for downstream
-    ms.meshing_decimation_quadric_edge_collapse(targetfacenum=120_000,
+    # Decimate to a manageable count for downstream. Lower target than we
+    # used to: the triangle-trivial-per-wedge parametriser needs UV space
+    # proportional to (face_count × border_pixels). At 120k faces with
+    # border=2 in a 4096 atlas the budget overflows ("Inter-Triangle
+    # border is too much"). 60k faces + border=1 fits comfortably and
+    # the cylindrical remap on the Mac side replaces this UV anyway.
+    ms.meshing_decimation_quadric_edge_collapse(targetfacenum=60_000,
                                                 preserveboundary=True,
                                                 preservenormal=True)
+    # Clean degenerate triangles that bloat parametrisation perimeter
+    ms.meshing_remove_null_faces()
+    ms.meshing_remove_unreferenced_vertices()
+    ms.meshing_remove_duplicate_faces()
 
-    # UV unwrap (atlas-based) — purely so projection has a UV target.
-    # The cylindrical_remap.py step on the Mac will REPLACE this UV later.
-    ms.compute_texcoord_parametrization_triangle_trivial_per_wedge(
-        sidedim=tex_size, textdim=tex_size, border=2,
-        method="Space-optimizing")
+    # UV unwrap — try the cheap "trivial per wedge" first. If the
+    # mesh has weird topology that still overflows the atlas budget,
+    # fall back to LSCM (slower, but always succeeds on closed limb-shapes).
+    print(f"[extract] post-clean mesh: "
+          f"{ms.current_mesh().vertex_number()} verts, "
+          f"{ms.current_mesh().face_number()} faces", flush=True)
+    try:
+        ms.compute_texcoord_parametrization_triangle_trivial_per_wedge(
+            sidedim=tex_size, textdim=tex_size, border=1,
+            method="Space-optimizing")
+    except Exception as e:
+        print(f"[extract] trivial-per-wedge UV failed ({e}) — "
+              "falling back to atlas parametrisation", flush=True)
+        # Atlas-based isometric unwrap — robust to arbitrary topology
+        ms.compute_texcoord_parametrization_and_texture_from_registered_rasters(
+            texturename="mesh_albedo.png", texturewidth=tex_size,
+            textureheight=tex_size,
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     obj_path = out_dir / "mesh.obj"
