@@ -20,10 +20,27 @@ import cv2
 import numpy as np
 
 
+# 2DGS's render_utils.py imports mediapy, which isn't pulled in by anything
+# else in the image. Auto-install on first use so we don't need a Docker
+# rebuild to fix it. Once requirements.txt includes mediapy, this becomes
+# a no-op (the import succeeds immediately).
+def _ensure_mediapy() -> None:
+    try:
+        import mediapy  # noqa: F401
+    except ImportError:
+        print("[extract] mediapy not installed — pip installing now",
+              flush=True)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "mediapy"]
+        )
+        print("[extract] mediapy installed", flush=True)
+
+
 def extract_mesh(workdir: Path, model_dir: Path) -> Path:
     """
     Run 2DGS mesh extraction (TSDF fusion). Returns path to resulting OBJ.
     """
+    _ensure_mediapy()
     cmd = [
         sys.executable, "/workspace/2dgs/render.py",
         "-s", str(workdir),

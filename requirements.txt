@@ -26,6 +26,9 @@ matplotlib>=3.7
 # Mesh processing
 pymeshlab>=2023.12
 
+# 2DGS's render_utils.py imports this — not pulled in by anything else
+mediapy>=1.2
+
 # Misc
 pyyaml>=6.0
 omegaconf>=2.3
