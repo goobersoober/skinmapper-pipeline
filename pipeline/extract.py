@@ -20,27 +20,39 @@ import cv2
 import numpy as np
 
 
-# 2DGS's render_utils.py imports mediapy, which isn't pulled in by anything
-# else in the image. Auto-install on first use so we don't need a Docker
-# rebuild to fix it. Once requirements.txt includes mediapy, this becomes
-# a no-op (the import succeeds immediately).
-def _ensure_mediapy() -> None:
-    try:
-        import mediapy  # noqa: F401
-    except ImportError:
-        print("[extract] mediapy not installed — pip installing now",
-              flush=True)
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", "mediapy"]
-        )
-        print("[extract] mediapy installed", flush=True)
+# 2DGS's render.py and mesh_utils.py have undeclared deps:
+#   - mediapy (in render_utils.py)
+#   - open3d  (in mesh_utils.py, used for TSDF mesh fusion)
+# Neither is in our requirements.txt. Auto-install on first use so we
+# don't need a Docker rebuild whenever 2DGS adds another import. Once
+# requirements.txt covers them, this becomes a no-op.
+_2DGS_DEPS = [
+    ("mediapy", "mediapy"),
+    ("open3d",  "open3d"),
+]
+
+
+def _ensure_2dgs_deps() -> None:
+    missing = []
+    for mod, pkg in _2DGS_DEPS:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if not missing:
+        return
+    print(f"[extract] installing missing 2DGS deps: {missing}", flush=True)
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--quiet", *missing]
+    )
+    print(f"[extract] installed {missing}", flush=True)
 
 
 def extract_mesh(workdir: Path, model_dir: Path) -> Path:
     """
     Run 2DGS mesh extraction (TSDF fusion). Returns path to resulting OBJ.
     """
-    _ensure_mediapy()
+    _ensure_2dgs_deps()
     cmd = [
         sys.executable, "/workspace/2dgs/render.py",
         "-s", str(workdir),

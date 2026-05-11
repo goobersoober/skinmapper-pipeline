@@ -26,8 +26,9 @@ matplotlib>=3.7
 # Mesh processing
 pymeshlab>=2023.12
 
-# 2DGS's render_utils.py imports this — not pulled in by anything else
+# 2DGS undeclared deps — render_utils + mesh_utils import these
 mediapy>=1.2
+open3d>=0.18
 
 # Misc
 pyyaml>=6.0
