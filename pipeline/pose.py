@@ -58,7 +58,7 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
         print(f"[pose] computing DINOv2 embeddings for {n} images...",
               flush=True)
         embeddings = compute_dinov2_embeddings(image_paths, device=device)
-        k = 12
+        k = 6
         pair_idx = top_k_pairs(embeddings, k=k)
         pairs = make_retrieval_pairs(images, pair_idx, symmetrize=True)
         strategy = f"dinov2-top{k}"
@@ -79,7 +79,7 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
     for i in range(0, len(pairs), CHUNK):
         chunk = pairs[i:i + CHUNK]
         try:
-            out = inference(chunk, model, device, batch_size=1, verbose=False)
+            out = inference(chunk, model, device, batch_size=4, verbose=False)
             all_view1.extend(out["view1"] if isinstance(out["view1"], list)
                              else [out["view1"]])
             all_view2.extend(out["view2"] if isinstance(out["view2"], list)
