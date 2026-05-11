@@ -27,29 +27,18 @@ from PIL import Image
 # warper's attribute proxy. Patch it directly onto BertModel + the warper.
 try:
     from transformers.models.bert.modeling_bert import BertModel as _BertModel
-    from transformers.modeling_utils import ModuleUtilsMixin as _MUM
 
-    def _get_head_mask(self, head_mask, num_hidden_layers,
-                       is_attention_chunked=False):
-        if head_mask is not None:
-            head_mask = _MUM.get_head_mask(
-                self, head_mask, num_hidden_layers, is_attention_chunked)
-        else:
-            head_mask = [None] * num_hidden_layers
-        return head_mask
+    # GroundingDINO never actually prunes attention heads, so head_mask is
+    # always None or unused. Short-circuit to a no-op that returns the
+    # expected list-of-None shape. This dodges all dtype/device issues in
+    # the original `_convert_head_mask_to_5d` codepath.
+    def _get_head_mask_noop(self, head_mask, num_hidden_layers,
+                            is_attention_chunked=False):
+        return [None] * num_hidden_layers
 
-    _BertModel.get_head_mask = _get_head_mask
-    print("[segment] applied BertModel.get_head_mask patch", flush=True)
-
-    # Also patch GroundingDINO's BertModelWarper if importable
-    try:
-        from groundingdino.models.GroundingDINO import bertwarper as _bw
-        if hasattr(_bw, "BertModelWarper"):
-            _bw.BertModelWarper.get_head_mask = _get_head_mask
-            print("[segment] applied BertModelWarper.get_head_mask patch",
-                  flush=True)
-    except Exception as _e_bw:
-        print(f"[segment] BertModelWarper patch skipped: {_e_bw}", flush=True)
+    _BertModel.get_head_mask = _get_head_mask_noop
+    print("[segment] applied BertModel.get_head_mask no-op patch",
+          flush=True)
 except Exception as _e:
     print(f"[segment] BertModel patch skipped: {_e}", flush=True)
 

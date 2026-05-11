@@ -89,14 +89,20 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
             return tuple(_to_cpu(val) for val in obj)
         return obj
 
-    def _ensure_list(x):
-        return x if isinstance(x, list) else [x]
-
     # Chunked inference with BF16 mixed precision + graceful failure handling.
     # BF16 cuts VRAM use ~2× and is ~2× faster on Ampere/Hopper, with no
     # measurable quality loss for MASt3R's transformer architecture.
+    #
+    # MASt3R's inference() returns view1/view2/pred1/pred2 as DICTS where
+    # values are stacked tensors of shape (chunk_size, ...) plus list-of-int
+    # fields like `idx`. We collect the per-chunk dicts and then concatenate
+    # them along dim 0 (tensors) / extend (lists) so global_aligner sees a
+    # single combined dict, not a list of dicts.
     CHUNK = 32
-    all_view1, all_view2, all_pred1, all_pred2 = [], [], [], []
+    chunk_view1: list = []
+    chunk_view2: list = []
+    chunk_pred1: list = []
+    chunk_pred2: list = []
     failed = 0
     for i in range(0, len(pairs), CHUNK):
         chunk = pairs[i:i + CHUNK]
@@ -104,16 +110,12 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = inference(chunk, model, device,
                                 batch_size=4, verbose=False)
-            # Convert to CPU immediately — this is what frees VRAM.
-            v1 = _to_cpu(_ensure_list(out["view1"]))
-            v2 = _to_cpu(_ensure_list(out["view2"]))
-            p1 = _to_cpu(_ensure_list(out["pred1"]))
-            p2 = _to_cpu(_ensure_list(out["pred2"]))
-            all_view1.extend(v1)
-            all_view2.extend(v2)
-            all_pred1.extend(p1)
-            all_pred2.extend(p2)
-            del out, v1, v2, p1, p2
+            # Convert to CPU immediately — frees VRAM between chunks.
+            chunk_view1.append(_to_cpu(out["view1"]))
+            chunk_view2.append(_to_cpu(out["view2"]))
+            chunk_pred1.append(_to_cpu(out["pred1"]))
+            chunk_pred2.append(_to_cpu(out["pred2"]))
+            del out
             print(f"[pose] inference {min(i+CHUNK, len(pairs))}/{len(pairs)} pairs",
                   flush=True)
         except Exception as e:
@@ -132,8 +134,36 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
                 "registration would be unreliable."
             )
 
-    output = {"view1": all_view1, "view2": all_view2,
-               "pred1": all_pred1, "pred2": all_pred2}
+    def _merge_chunk_dicts(chunks: list) -> dict:
+        """Combine a list of per-chunk dicts into one concatenated dict."""
+        if not chunks:
+            return {}
+        keys = list(chunks[0].keys())
+        merged: dict = {}
+        for k in keys:
+            vals = [c[k] for c in chunks if k in c]
+            if not vals:
+                continue
+            first = vals[0]
+            if isinstance(first, torch.Tensor):
+                merged[k] = torch.cat(vals, dim=0)
+            elif isinstance(first, list):
+                merged[k] = [item for sub in vals for item in sub]
+            elif isinstance(first, tuple):
+                # Flatten tuples too (rare)
+                merged[k] = tuple(item for sub in vals for item in sub)
+            else:
+                # Scalar / non-collectable: just keep the first
+                merged[k] = first
+        return merged
+
+    output = {
+        "view1": _merge_chunk_dicts(chunk_view1),
+        "view2": _merge_chunk_dicts(chunk_view2),
+        "pred1": _merge_chunk_dicts(chunk_pred1),
+        "pred2": _merge_chunk_dicts(chunk_pred2),
+    }
+    del chunk_view1, chunk_view2, chunk_pred1, chunk_pred2
 
     scene = global_aligner(output, device=device,
                            mode=GlobalAlignerMode.PointCloudOptimizer)
