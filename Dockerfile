@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget curl unzip ca-certificates \
     libheif-dev libheif1 \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    libopengl0 libegl1 \
     ffmpeg \
     build-essential cmake ninja-build \
     && rm -rf /var/lib/apt/lists/*

@@ -53,6 +53,37 @@ def _ensure_2dgs_deps() -> None:
     print(f"[extract] installed {missing}", flush=True)
 
 
+def _ensure_pymeshlab_system_libs() -> None:
+    """pymeshlab's IO plugins (libio_base.so etc) dlopen libOpenGL.so.0,
+    libEGL.so.1, etc. The base image doesn't ship them. apt-install at
+    runtime as root since RunPod containers run as root anyway. Permanent
+    fix is in Dockerfile (libopengl0 libegl1).
+    """
+    lib_path = Path("/usr/lib/x86_64-linux-gnu/libOpenGL.so.0")
+    if lib_path.exists():
+        return
+    print("[extract] installing pymeshlab system libs (libopengl0 libegl1)",
+          flush=True)
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    try:
+        subprocess.check_call(
+            ["apt-get", "update", "-qq"], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.check_call(
+            ["apt-get", "install", "-y", "--no-install-recommends",
+             "libopengl0", "libegl1"],
+            env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print("[extract] system libs installed", flush=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[extract] apt install failed ({e}) — pymeshlab may not "
+              "be able to read PLY files. Permanent fix is in Dockerfile.",
+              flush=True)
+
+
 def extract_mesh(workdir: Path, model_dir: Path) -> Path:
     """
     Run 2DGS mesh extraction (TSDF fusion). Returns path to resulting OBJ.
@@ -120,6 +151,7 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
     baking. pymeshlab's `compute_texmap_from_registered_rasters` is the
     classical photo-projection route.
     """
+    _ensure_pymeshlab_system_libs()
     import pymeshlab as ml
 
     ms = ml.MeshSet()
