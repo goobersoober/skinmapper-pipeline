@@ -20,6 +20,39 @@ import numpy as np
 import torch
 from PIL import Image
 
+# ---- Compatibility shim for GroundingDINO + modern transformers ----
+# GroundingDINO uses a BertModelWarper that calls get_head_mask on the
+# wrapped BertModel. In transformers >= 4.36 the method was hoisted to
+# ModuleUtilsMixin and some Bert variants no longer expose it through the
+# warper's attribute proxy. Patch it directly onto BertModel + the warper.
+try:
+    from transformers.models.bert.modeling_bert import BertModel as _BertModel
+    from transformers.modeling_utils import ModuleUtilsMixin as _MUM
+
+    def _get_head_mask(self, head_mask, num_hidden_layers,
+                       is_attention_chunked=False):
+        if head_mask is not None:
+            head_mask = _MUM.get_head_mask(
+                self, head_mask, num_hidden_layers, is_attention_chunked)
+        else:
+            head_mask = [None] * num_hidden_layers
+        return head_mask
+
+    _BertModel.get_head_mask = _get_head_mask
+    print("[segment] applied BertModel.get_head_mask patch", flush=True)
+
+    # Also patch GroundingDINO's BertModelWarper if importable
+    try:
+        from groundingdino.models.GroundingDINO import bertwarper as _bw
+        if hasattr(_bw, "BertModelWarper"):
+            _bw.BertModelWarper.get_head_mask = _get_head_mask
+            print("[segment] applied BertModelWarper.get_head_mask patch",
+                  flush=True)
+    except Exception as _e_bw:
+        print(f"[segment] BertModelWarper patch skipped: {_e_bw}", flush=True)
+except Exception as _e:
+    print(f"[segment] BertModel patch skipped: {_e}", flush=True)
+
 # Map iOS body_part values → GroundingDINO text prompts
 PROMPT_BY_BODY_PART: Dict[str, str] = {
     "forearm":   "human forearm . arm . hand .",

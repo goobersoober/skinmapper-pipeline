@@ -58,11 +58,12 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
         print(f"[pose] computing DINOv2 embeddings for {n} images...",
               flush=True)
         embeddings = compute_dinov2_embeddings(image_paths, device=device)
-        # k=12 = Polycam-level pair density. Sufficient for any shooting style
-        # including mixed-distance captures and backtracking. The previous
-        # OOMs at k=12 were a memory-leak bug (tensors stayed on GPU
-        # between chunks), not a fundamental limitation — fixed below.
-        k = 12
+        # k=8 = solid pair density (still far better than temporal swin-k).
+        # k=12 OOMs host RAM at ~pair 900 because each pair's view/pred
+        # dicts hold ~80MB of feature maps and we accumulate all of them
+        # before global_aligner runs. To raise this back to 12 we'd need
+        # to stream pair outputs to disk between chunks (TODO).
+        k = 8
         pair_idx = top_k_pairs(embeddings, k=k)
         pairs = make_retrieval_pairs(images, pair_idx, symmetrize=True)
         strategy = f"dinov2-top{k}"
