@@ -38,9 +38,13 @@ RUN pip install --upgrade pip setuptools wheel && \
       "torchaudio==2.5.1+cu118" \
       --index-url https://download.pytorch.org/whl/cu118
 
-# Python deps — installed after torch is pinned
+# Python deps — installed after torch is pinned.
+# --ignore-installed blinker is needed because open3d pulls a newer
+# blinker as a transitive dep, but pip refuses to uninstall the system
+# Ubuntu blinker 1.4 (installed via distutils, not pip). Without the
+# flag, the build fails with "uninstall-distutils-installed-package".
 COPY requirements.txt /workspace/requirements.txt
-RUN pip install -r /workspace/requirements.txt
+RUN pip install --ignore-installed blinker -r /workspace/requirements.txt
 
 # --- 2D Gaussian Splatting (with CUDA submodules) ---
 RUN git clone https://github.com/hbb1/2d-gaussian-splatting.git /workspace/2dgs
