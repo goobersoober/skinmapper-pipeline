@@ -97,7 +97,7 @@ def run_pipeline(job_input: dict) -> dict:
 
     scan_type = job_input.get("scan_type", "design")
     body_part = job_input.get("body_part", "leg")
-    iterations = int(job_input.get("iterations", 7_000))
+    iterations = int(job_input.get("iterations", 15_000))
 
     work = make_workdir()
     print(f"[pipe] workdir = {work}", flush=True)
@@ -130,10 +130,10 @@ def run_pipeline(job_input: dict) -> dict:
             raise ValueError(f"need at least 15 photos, got {len(photos)}")
         stats["photos_input"] = len(photos)
 
-        # Subsample to max 60 photos — quality plateaus past this for limb-sized
-        # objects, and more photos slow MASt3R proportionally. We sample evenly
-        # to preserve full coverage regardless of capture style.
-        MAX_PHOTOS = 60
+        # Sanity cap at 200 photos — enough for the largest realistic capture
+        # (full backpiece with mixed close-up + wide shots). Subsample evenly
+        # only if user uploads more, to guard against abuse / runaway captures.
+        MAX_PHOTOS = 200
         if len(photos) > MAX_PHOTOS:
             step = len(photos) / MAX_PHOTOS
             photos = [photos[int(i * step)] for i in range(MAX_PHOTOS)]
