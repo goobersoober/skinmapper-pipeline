@@ -39,12 +39,27 @@ RUN pip install --upgrade pip setuptools wheel && \
       --index-url https://download.pytorch.org/whl/cu118
 
 # Python deps — installed after torch is pinned.
-# --ignore-installed blinker is needed because open3d pulls a newer
-# blinker as a transitive dep, but pip refuses to uninstall the system
-# Ubuntu blinker 1.4 (installed via distutils, not pip). Without the
-# flag, the build fails with "uninstall-distutils-installed-package".
+#
+# --ignore-installed blinker:
+#   open3d pulls a newer blinker as a transitive dep, but pip refuses to
+#   uninstall the system Ubuntu blinker 1.4 (distutils-installed). Without
+#   the flag, the build fails with "uninstall-distutils-installed-package".
+#
+# --extra-index-url + the torch pin lines below:
+#   accelerate >= 0.30 declares "torch >= 2.0.0". Without the index hint,
+#   pip ignores our existing 2.5.1+cu118 install and upgrades to torch
+#   2.11.0+cu130, which then fails to compile diff-surfel-rasterization
+#   against the image's CUDA 11.8 toolkit. Re-declaring the cu118 wheel
+#   pin here keeps pip from "fixing" what it thinks is an unsatisfied
+#   torch requirement.
 COPY requirements.txt /workspace/requirements.txt
-RUN pip install --ignore-installed blinker -r /workspace/requirements.txt
+RUN pip install \
+      --ignore-installed blinker \
+      --extra-index-url https://download.pytorch.org/whl/cu118 \
+      "torch==2.5.1+cu118" \
+      "torchvision==0.20.1+cu118" \
+      "torchaudio==2.5.1+cu118" \
+      -r /workspace/requirements.txt
 
 # --- 2D Gaussian Splatting (with CUDA submodules) ---
 RUN git clone https://github.com/hbb1/2d-gaussian-splatting.git /workspace/2dgs
