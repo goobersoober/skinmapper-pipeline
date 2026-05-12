@@ -29,6 +29,7 @@ import numpy as np
 _2DGS_DEPS = [
     ("mediapy", "mediapy"),
     ("open3d",  "open3d"),
+    ("xatlas",  "xatlas"),    # robust UV atlas packer for texture bake
 ]
 
 
@@ -152,15 +153,13 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
     classical photo-projection route.
     """
     _ensure_pymeshlab_system_libs()
-    import pymeshlab as ml
+    # pymeshlab is no longer used for decimation OR UV — both are broken
+    # in v2025. Open3D handles decimation, xatlas handles UV, and we
+    # write the OBJ manually. pymeshlab stays a runtime dep only because
+    # later parts of bake (texture projection) still use it.
 
-    # --- Open3D pre-decimation ---
-    # pymeshlab 2025's meshing_decimation_quadric_edge_collapse silently
-    # returns without decimating (API change?), leaving the 22M-face
-    # TSDF mesh intact. The trivial-per-wedge parametriser then can't
-    # fit ~22M triangles in any UV atlas budget. Decimate with Open3D
-    # FIRST, then hand the already-small mesh to pymeshlab.
-    import open3d as o3d  # already pulled in by _ensure_2dgs_deps above
+    # --- Open3D mesh decimation ---
+    import open3d as o3d
     o3d_mesh = o3d.io.read_triangle_mesh(str(mesh_ply))
     n_in = len(o3d_mesh.triangles)
     print(f"[extract] loaded mesh: {len(o3d_mesh.vertices)} verts, "
@@ -170,43 +169,45 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
         o3d_mesh = o3d_mesh.simplify_quadric_decimation(
             target_number_of_triangles=TARGET_FACES,
         )
-        o3d_mesh.remove_duplicated_vertices()
-        o3d_mesh.remove_degenerate_triangles()
-        o3d_mesh.remove_unreferenced_vertices()
-        n_out = len(o3d_mesh.triangles)
-        print(f"[extract] open3d decimated: {n_in} → {n_out} faces",
-              flush=True)
-    # Write the decimated mesh to a fresh file so pymeshlab picks it up
-    decimated_ply = mesh_ply.with_name("mesh_decimated.ply")
-    o3d.io.write_triangle_mesh(str(decimated_ply), o3d_mesh)
-    del o3d_mesh
+    o3d_mesh.remove_duplicated_vertices()
+    o3d_mesh.remove_degenerate_triangles()
+    o3d_mesh.remove_unreferenced_vertices()
+    n_out = len(o3d_mesh.triangles)
+    print(f"[extract] decimated to {n_out} faces", flush=True)
 
-    ms = ml.MeshSet()
-    ms.load_new_mesh(str(decimated_ply))
-    print(f"[extract] pymeshlab loaded: "
-          f"{ms.current_mesh().vertex_number()} verts, "
-          f"{ms.current_mesh().face_number()} faces", flush=True)
+    # --- xatlas UV parametrisation ---
+    # xatlas is the same library Blender and Substance use under the hood.
+    # It produces clean non-overlapping UVs even for arbitrary topology.
+    import xatlas
+    vertices = np.asarray(o3d_mesh.vertices, dtype=np.float32)
+    faces = np.asarray(o3d_mesh.triangles, dtype=np.uint32)
+    print(f"[extract] xatlas parametrise: {len(vertices)} verts, "
+          f"{len(faces)} faces", flush=True)
+    vmapping, new_faces, uvs = xatlas.parametrize(vertices, faces)
+    print(f"[extract] xatlas done: {len(vmapping)} unique uv-verts, "
+          f"{len(new_faces)} faces", flush=True)
+    # vmapping[i] = index into original `vertices` for new vertex i.
+    # `new_faces` indexes into the new vertex array.
+    new_vertices = vertices[vmapping]
 
-    # Light cleanup — these are small ops at this scale
-    ms.meshing_remove_duplicate_vertices()
-    ms.meshing_remove_null_faces()
-    ms.meshing_remove_unreferenced_vertices()
-
-    # UV unwrap. Now that we're at <100k faces with border=1 in a 4096
-    # atlas the perimeter budget is well under the texture area.
-    ms.compute_texcoord_parametrization_triangle_trivial_per_wedge(
-        sidedim=tex_size, textdim=tex_size, border=1,
-        method="Space-optimizing")
-
+    # --- Write OBJ with UVs manually (much faster + simpler than pymeshlab) ---
     out_dir.mkdir(parents=True, exist_ok=True)
     obj_path = out_dir / "mesh.obj"
     tex_orig = out_dir / "mesh_original.png"
     tex_albedo = out_dir / "mesh_albedo.png"
+    with obj_path.open("w") as f:
+        f.write("mtllib mesh.mtl\nusemtl skin\n")
+        for v in new_vertices:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for uv in uvs:
+            f.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
+        # OBJ is 1-indexed; pair each vertex with the matching UV index.
+        for face in new_faces:
+            a, b, c = int(face[0]) + 1, int(face[1]) + 1, int(face[2]) + 1
+            f.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
+    print(f"[extract] wrote {obj_path}", flush=True)
 
-    # Save the OBJ first (so its UVs are available for projection)
-    ms.save_current_mesh(str(obj_path),
-                         save_textures=False,
-                         save_vertex_color=False)
+    del o3d_mesh
 
     # Project source photos to texture (use SAM 2 masks to discount
     # background pixels — only limb pixels contribute to the bake)
