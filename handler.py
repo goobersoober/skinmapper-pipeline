@@ -225,6 +225,48 @@ def run_pipeline(job_input: dict) -> dict:
         stats["depth_densify"] = densify_stats
         _step(f"Depth-init densify — {densify_stats}", t_step)
 
+        # 6c. Apply masks to training images so 2DGS only reconstructs the
+        # limb, not the surrounding scene. Save the originals first so
+        # texture baking can restore them afterwards (project_views_to_texture
+        # needs original photo colors, not blacked-out training versions).
+        images_dir = work / "images"
+        images_orig_dir = work / "images_orig"
+        if mask_dir is not None and mask_dir.exists():
+            import cv2
+            import numpy as np
+            images_orig_dir.mkdir(exist_ok=True)
+            n_masked = 0
+            for img_p in sorted(images_dir.iterdir()):
+                if img_p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                    continue
+                # Save original so we can restore for texture baking
+                shutil.copy2(img_p, images_orig_dir / img_p.name)
+
+                mask_p = mask_dir / (img_p.stem + ".png")
+                if not mask_p.exists():
+                    continue
+                img = cv2.imread(str(img_p))
+                mask = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE)
+                if img is None or mask is None:
+                    continue
+                if mask.shape != img.shape[:2]:
+                    mask = cv2.resize(mask, (img.shape[1], img.shape[0]),
+                                      interpolation=cv2.INTER_NEAREST)
+                # Soft edge: erode mask 3px then gaussian-blur so the limb
+                # boundary doesn't become a hard cliff in the reconstruction
+                mask = cv2.erode(mask, np.ones((3, 3), np.uint8))
+                mask = cv2.GaussianBlur(mask, (7, 7), 2.0)
+                mask_f = (mask.astype(np.float32) / 255.0)[..., None]
+                masked = (img.astype(np.float32) * mask_f).astype(np.uint8)
+                cv2.imwrite(str(img_p), masked,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                n_masked += 1
+            print(f"[pipe] masked {n_masked} training images "
+                  f"(background → black, originals saved for bake)",
+                  flush=True)
+            stats["images_masked"] = n_masked
+        _step("apply masks to training images", t_step)
+
         # 7. 2DGS training
         ply = train_2dgs(work, iterations=iterations,
                          normal_loss_weight=0.10,
@@ -254,6 +296,17 @@ def run_pipeline(job_input: dict) -> dict:
             raise
         except Exception as _mc_e:
             print(f"[mesh] mesh validation skipped: {_mc_e}", flush=True)
+
+        # 8b. Restore original (unmasked) images for texture baking. We
+        # masked them to black for 2DGS training so geometry stayed inside
+        # the limb; but project_views_to_texture needs the real photo
+        # colors. mask_dir still gates which pixels are sampled, so the
+        # baked texture stays clean either way.
+        if images_orig_dir.exists():
+            for orig in sorted(images_orig_dir.iterdir()):
+                shutil.copy2(orig, images_dir / orig.name)
+            print(f"[pipe] restored {sum(1 for _ in images_orig_dir.iterdir())} "
+                  "original images for texture bake", flush=True)
 
         # 9. Texture baking — masks gate which photo pixels contribute
         out_dir = work / "out"
