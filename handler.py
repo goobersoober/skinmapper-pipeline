@@ -52,10 +52,10 @@ _hb("importing pipeline.depth (Depth Anything v2)")
 from pipeline.depth    import estimate_depth_folder
 _hb("importing pipeline.pose (MASt3R + DINOv2)")
 from pipeline.pose     import estimate_poses
-_hb("importing pipeline.train (2DGS)")
-from pipeline.train    import train_2dgs
+_hb("importing pipeline.depth_fusion (Poisson surface)")
+from pipeline.depth_fusion import fuse_depths_to_mesh
 _hb("importing pipeline.extract (mesh + textures)")
-from pipeline.extract  import extract_mesh, bake_textures
+from pipeline.extract  import bake_textures
 _hb("all pipeline modules imported — ready to receive jobs")
 
 
@@ -213,10 +213,13 @@ def run_pipeline(job_input: dict) -> dict:
                 f"insufficient overlap between consecutive shots, or motion blur"
             )
 
-        # 6b. Densify points3D.txt with depth-prior projection. Cap total
-        # added points to avoid OOM during 2DGS init.
-        MAX_DENSIFY = 200_000
-        per_view = max(1000, MAX_DENSIFY // max(1, len(jpeg_paths)))
+        # 6b. Densify points3D.txt with depth-prior projection. With the
+        # depth-fusion pipeline (no 2DGS), this is the *primary* geometry
+        # signal — we want a much denser point cloud than what we needed
+        # just for 2DGS init. ~30k points per view → ~2-3M total for 78
+        # views, comfortable for Poisson surface reconstruction.
+        MAX_DENSIFY = 3_000_000
+        per_view = max(5_000, MAX_DENSIFY // max(1, len(jpeg_paths)))
         from pipeline.pose import densify_points_with_depth
         densify_stats = densify_points_with_depth(
             workdir=work, depth_dir=depth_dir, mask_dir=mask_dir,
@@ -225,60 +228,16 @@ def run_pipeline(job_input: dict) -> dict:
         stats["depth_densify"] = densify_stats
         _step(f"Depth-init densify — {densify_stats}", t_step)
 
-        # 6c. Apply masks to training images so 2DGS only reconstructs the
-        # limb, not the surrounding scene. Save the originals first so
-        # texture baking can restore them afterwards (project_views_to_texture
-        # needs original photo colors, not blacked-out training versions).
-        images_dir = work / "images"
-        images_orig_dir = work / "images_orig"
-        if mask_dir is not None and mask_dir.exists():
-            import cv2
-            import numpy as np
-            images_orig_dir.mkdir(exist_ok=True)
-            n_masked = 0
-            for img_p in sorted(images_dir.iterdir()):
-                if img_p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
-                    continue
-                # Save original so we can restore for texture baking
-                shutil.copy2(img_p, images_orig_dir / img_p.name)
+        # The masked-training-images dance and 2DGS training are gone —
+        # the new pipeline reconstructs geometry directly from the
+        # densified depth-fused point cloud via Poisson surface
+        # reconstruction. workdir/images/ stays as-is (unmasked
+        # originals) so texture baking can read them directly.
 
-                mask_p = mask_dir / (img_p.stem + ".png")
-                if not mask_p.exists():
-                    continue
-                img = cv2.imread(str(img_p))
-                mask = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE)
-                if img is None or mask is None:
-                    continue
-                if mask.shape != img.shape[:2]:
-                    mask = cv2.resize(mask, (img.shape[1], img.shape[0]),
-                                      interpolation=cv2.INTER_NEAREST)
-                # Soft edge: erode mask 3px then gaussian-blur so the limb
-                # boundary doesn't become a hard cliff in the reconstruction
-                mask = cv2.erode(mask, np.ones((3, 3), np.uint8))
-                mask = cv2.GaussianBlur(mask, (7, 7), 2.0)
-                mask_f = (mask.astype(np.float32) / 255.0)[..., None]
-                masked = (img.astype(np.float32) * mask_f).astype(np.uint8)
-                cv2.imwrite(str(img_p), masked,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                n_masked += 1
-            print(f"[pipe] masked {n_masked} training images "
-                  f"(background → black, originals saved for bake)",
-                  flush=True)
-            stats["images_masked"] = n_masked
-        _step("apply masks to training images", t_step)
-
-        # 7. 2DGS training
-        ply = train_2dgs(work, iterations=iterations,
-                         normal_loss_weight=0.10,
-                         distortion_loss_weight=1000.0,
-                         depth_dir=depth_dir)
-        stats["trained_ply"] = str(ply)
-        _step(f"2DGS training — {iterations} iters", t_step)
-
-        # 8. Mesh extraction
-        model_dir = work / "output"
-        mesh_ply = extract_mesh(work, model_dir)
-        _step(f"mesh extraction — {mesh_ply.name}", t_step)
+        # 7. Depth fusion → Poisson surface reconstruction
+        from pipeline.depth_fusion import fuse_depths_to_mesh
+        mesh_ply = fuse_depths_to_mesh(work)
+        _step(f"depth-fuse + Poisson — {mesh_ply.name}", t_step)
 
         # GUARD: validate mesh has actual content
         try:
@@ -289,24 +248,13 @@ def run_pipeline(job_input: dict) -> dict:
             print(f"[mesh] raw mesh: {n_v} verts, {n_f} faces", flush=True)
             if n_f < 1000:
                 raise RuntimeError(
-                    f"Extracted mesh has only {n_f} faces — TSDF fusion "
-                    f"likely failed. Check 2DGS training quality."
+                    f"Extracted mesh has only {n_f} faces — depth fusion "
+                    f"likely failed. Check depth maps and mask quality."
                 )
         except RuntimeError:
             raise
         except Exception as _mc_e:
             print(f"[mesh] mesh validation skipped: {_mc_e}", flush=True)
-
-        # 8b. Restore original (unmasked) images for texture baking. We
-        # masked them to black for 2DGS training so geometry stayed inside
-        # the limb; but project_views_to_texture needs the real photo
-        # colors. mask_dir still gates which pixels are sampled, so the
-        # baked texture stays clean either way.
-        if images_orig_dir.exists():
-            for orig in sorted(images_orig_dir.iterdir()):
-                shutil.copy2(orig, images_dir / orig.name)
-            print(f"[pipe] restored {sum(1 for _ in images_orig_dir.iterdir())} "
-                  "original images for texture bake", flush=True)
 
         # 9. Texture baking — masks gate which photo pixels contribute
         out_dir = work / "out"
@@ -358,7 +306,7 @@ def run_pipeline(job_input: dict) -> dict:
                     step = max(1, len(masks) // 4)
                     samples = masks[::step][:4]
                     for m in samples:
-                        photo = work / "images_orig" / (m.stem + ".jpg")
+                        photo = work / "images" / (m.stem + ".jpg")
                         if not photo.exists():
                             photo = work / "jpegs" / (m.stem + ".jpg")
                         if photo.exists():
