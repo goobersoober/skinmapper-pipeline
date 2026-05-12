@@ -297,19 +297,52 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
                     f"{t[0]:.6f} {t[1]:.6f} {t[2]:.6f} {i} {name}\n")
             f.write("\n")  # empty 2D points line
 
-    # ----- write points3D.txt — sample a sparse subset of the dense output -----
+    # ----- write points3D.txt -----
+    # MASt3R's get_pts3d() returns dense (H, W, 3) per view in a single
+    # globally-consistent world frame. These are exactly the points we
+    # want for depth fusion — no per-view RANSAC, no scale drift between
+    # views, no "stacked paper" layering.
+    #
+    # If SAM2 masks are available, filter to limb-only per view so the
+    # point cloud doesn't include floor/sock/background. Mask is at the
+    # JPEG resolution (≈550px); MASt3R works at 512 long-edge, so resize
+    # the mask to match each view's pts3d shape.
+    import cv2
+    mask_dir = workdir / "masks"
+    masks_available = mask_dir.exists()
+    if masks_available:
+        print(f"[pose] applying SAM2 masks to MASt3R pts3d", flush=True)
+
     n_pts = 0
     with (sparse_dir / "points3D.txt").open("w") as f:
+        # Apply the same scene scale we computed above so points match
+        # the rescaled cameras. pts3d are already scaled (we did
+        # `pt * scene_scale` above), but be explicit.
         idx = 1
         for view_i, (pts, conf) in enumerate(zip(pts3d, confs)):
             pts_np = pts.detach().cpu().numpy()    # (h, w, 3)
             conf_np = conf.detach().cpu().numpy()  # (h, w)
-            mask = conf_np > np.percentile(conf_np, 50)
-            xyz = pts_np[mask]
-            # Subsample to ~5k points per view
-            if len(xyz) > 5000:
-                sel = np.random.choice(len(xyz), 5000, replace=False)
-                xyz = xyz[sel]
+            mh, mw = pts_np.shape[:2]
+
+            # Confidence filter — keep top 70% (was 50%, but with masks
+            # we can afford to be less selective on confidence)
+            conf_thr = np.percentile(conf_np, 30)
+            keep = conf_np >= conf_thr
+
+            if masks_available:
+                img_name = image_paths[view_i].name
+                mask_p = mask_dir / (Path(img_name).stem + ".png")
+                if mask_p.exists():
+                    msk = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE)
+                    if msk is not None:
+                        msk = cv2.resize(msk, (mw, mh),
+                                         interpolation=cv2.INTER_NEAREST)
+                        keep = keep & (msk > 127)
+
+            xyz = pts_np[keep]
+            # Don't subsample — we want the densest possible point cloud
+            # for Poisson reconstruction. ~50k points per view × 78
+            # views = ~4M points, well within open3d's comfort zone.
             for p in xyz:
                 f.write(f"{idx} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f} 200 200 200 0.1\n")
                 idx += 1

@@ -314,20 +314,18 @@ def run_pipeline(job_input: dict) -> dict:
                 f"insufficient overlap between consecutive shots, or motion blur"
             )
 
-        # 6b. Densify points3D.txt with depth-prior projection. With the
-        # depth-fusion pipeline (no 2DGS), this is the *primary* geometry
-        # signal — we want a much denser point cloud than what we needed
-        # just for 2DGS init. ~30k points per view → ~2-3M total for 78
-        # views, comfortable for Poisson surface reconstruction.
-        MAX_DENSIFY = 3_000_000
-        per_view = max(5_000, MAX_DENSIFY // max(1, len(jpeg_paths)))
-        from pipeline.pose import densify_points_with_depth
-        densify_stats = densify_points_with_depth(
-            workdir=work, depth_dir=depth_dir, mask_dir=mask_dir,
-            jpeg_paths=jpeg_paths, samples_per_view=per_view,
-        )
-        stats["depth_densify"] = densify_stats
-        _step(f"Depth-init densify — {densify_stats}", t_step)
+        # 6b. (Depth-Anything densify removed.)
+        # We used to call densify_points_with_depth here which fits a
+        # per-view affine `metric = a * relative_depth + b` to align
+        # Depth-Anything outputs. That produced layered "venetian blind"
+        # meshes because each view's RANSAC fit is independent — small
+        # errors in (a, b) make the same skin patch land at slightly
+        # different absolute depths from each photo.
+        #
+        # MASt3R's get_pts3d() already gives us dense per-pixel 3D points
+        # in a single globally-consistent frame (no per-view scale drift).
+        # pose.estimate_poses now writes ALL of them (mask-filtered) to
+        # points3D.txt, so depth_fusion can read them directly.
 
         # The masked-training-images dance and 2DGS training are gone —
         # the new pipeline reconstructs geometry directly from the
