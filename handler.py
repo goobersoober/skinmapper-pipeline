@@ -344,6 +344,43 @@ def run_pipeline(job_input: dict) -> dict:
             )
         artefacts["mtl"].write_text(mtl)
 
+        # 10b. Save a few mask previews + photo samples for debugging.
+        # When the mesh comes back fragmented or off-shape, the first thing
+        # to check is whether the SAM2 masks are tight to the limb.
+        try:
+            import cv2 as _cv2
+            debug_dir = out_dir / "debug"
+            debug_dir.mkdir(exist_ok=True)
+            if mask_dir and mask_dir.exists():
+                masks = sorted(mask_dir.glob("*.png"))
+                # Take 4 evenly-spaced samples
+                if masks:
+                    step = max(1, len(masks) // 4)
+                    samples = masks[::step][:4]
+                    for m in samples:
+                        photo = work / "images_orig" / (m.stem + ".jpg")
+                        if not photo.exists():
+                            photo = work / "jpegs" / (m.stem + ".jpg")
+                        if photo.exists():
+                            img = _cv2.imread(str(photo))
+                            mask = _cv2.imread(str(m), _cv2.IMREAD_GRAYSCALE)
+                            if img is not None and mask is not None:
+                                mask3 = _cv2.cvtColor(mask, _cv2.COLOR_GRAY2BGR)
+                                if mask3.shape != img.shape:
+                                    mask3 = _cv2.resize(mask3,
+                                        (img.shape[1], img.shape[0]))
+                                # Side-by-side: original | mask | masked
+                                masked = _cv2.bitwise_and(img, mask3)
+                                combined = _cv2.hconcat([img, mask3, masked])
+                                _cv2.imwrite(
+                                    str(debug_dir / f"mask_preview_{m.stem}.jpg"),
+                                    combined,
+                                    [int(_cv2.IMWRITE_JPEG_QUALITY), 75])
+                    print(f"[pipe] wrote {len(samples)} mask previews to debug/",
+                          flush=True)
+        except Exception as _e:
+            print(f"[pipe] mask preview generation skipped: {_e}", flush=True)
+
         # 11. Zip result
         result_zip = work / "result.zip"
         _zip_dir(out_dir, result_zip)
