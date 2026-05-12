@@ -152,6 +152,11 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
     baking. pymeshlab's `compute_texmap_from_registered_rasters` is the
     classical photo-projection route.
     """
+    # Make sure runtime deps are installed. The 2DGS-era pipeline called
+    # _ensure_2dgs_deps() inside extract_mesh, but the depth-fusion path
+    # skips extract_mesh entirely, so bake_textures is now the first
+    # call site. Idempotent — no-op once installed.
+    _ensure_2dgs_deps()
     _ensure_pymeshlab_system_libs()
     # pymeshlab is no longer used for decimation OR UV — both are broken
     # in v2025. Open3D handles decimation, xatlas handles UV, and we
