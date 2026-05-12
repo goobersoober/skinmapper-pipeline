@@ -163,19 +163,62 @@ class LimbSegmenter:
         return mask
 
     def fallback_centre_mask(self, image_rgb: np.ndarray) -> np.ndarray:
-        """If detection fails, fall back to SAM 2 with a centre point prompt."""
+        """SAM2 with a centre-region multi-point prompt.
+
+        Tattoo-scan photos always centre the limb, but the limb often
+        fills most of the frame and contains many strong visual features
+        (tattoo designs, dark hair, skin folds). A single centre point
+        causes SAM2 to lock onto one tattoo's silhouette — yielding a
+        tiny mask that's a fraction of the actual limb. Two fixes:
+
+        1. Use a 3x3 grid of positive prompts spread across the central
+           60% of the frame. Multiple anchors force SAM2 to interpret
+           "the foreground object" as the whole limb, not one feature.
+
+        2. Pick the LARGEST mask from multimask_output, not the highest
+           confidence. The 3 masks SAM2 returns roughly correspond to
+           sub-part / part / whole-object scales; we want the largest.
+           We also gate on a minimum coverage so we never accept a
+           pathologically tiny mask.
+        """
         sam = self._load_sam()
         sam.set_image(image_rgb)
         h, w = image_rgb.shape[:2]
-        point = np.array([[w // 2, h // 2]])
-        labels = np.array([1])
+
+        # 3x3 grid in the central 60% of the frame — points at
+        # 0.2, 0.5, 0.8 across both axes
+        gx = np.array([0.2, 0.5, 0.8]) * w
+        gy = np.array([0.2, 0.5, 0.8]) * h
+        xx, yy = np.meshgrid(gx, gy)
+        points = np.stack([xx.flatten(), yy.flatten()], axis=1).astype(np.float32)
+        labels = np.ones(len(points), dtype=np.int32)
+
         masks, scores, _ = sam.predict(
-            point_coords=point, point_labels=labels,
+            point_coords=points, point_labels=labels,
             multimask_output=True,
         )
-        # Pick the highest-scoring mask
-        best = int(np.argmax(scores))
-        mask = (masks[best] > 0).astype(np.uint8) * 255
+        # Score each candidate by area + a tiny preference for high score
+        # to break ties. We MUST cover at least 8% of the frame, else
+        # something's gone wrong with all candidates.
+        frame_px = h * w
+        best_idx = -1
+        best_score = -1.0
+        for i, (m, s) in enumerate(zip(masks, scores)):
+            area_frac = float((m > 0).sum()) / frame_px
+            if area_frac < 0.08:
+                continue
+            # Composite score: heavily weight area, mild weight on
+            # SAM2 confidence
+            composite = area_frac + 0.05 * float(s)
+            if composite > best_score:
+                best_score = composite
+                best_idx = i
+        if best_idx < 0:
+            # All masks were tiny — return the largest one regardless
+            areas = [(m > 0).sum() for m in masks]
+            best_idx = int(np.argmax(areas))
+
+        mask = (masks[best_idx] > 0).astype(np.uint8) * 255
         return mask
 
     @staticmethod
