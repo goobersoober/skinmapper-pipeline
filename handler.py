@@ -208,6 +208,18 @@ def _step(label: str, t_prev: list[float]):
 def run_pipeline(job_input: dict) -> dict:
     t0 = time.time()
     t_step = [t0]
+
+    # Stamp the running version at the very top of every run. No more
+    # guessing whether a change deployed — one log line tells us.
+    try:
+        import subprocess as _sp
+        _ver = _sp.check_output(
+            ["git", "-C", "/workspace/skinmapper-pipeline",
+             "rev-parse", "--short", "HEAD"],
+            text=True, timeout=5).strip()
+        print(f"[pipe] === running version {_ver} ===", flush=True)
+    except Exception:
+        pass
     stats: dict = {}
 
     scan_type = job_input.get("scan_type", "design")

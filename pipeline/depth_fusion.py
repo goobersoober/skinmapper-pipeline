@@ -99,65 +99,55 @@ def fuse_depths_to_mesh(workdir: Path,
     print(f"[fuse] after outlier removal: {len(pcd.points):,} points",
           flush=True)
 
-    # Estimate normals — required for Poisson. Use a search radius based
-    # on the point cloud's spatial extent so it auto-scales.
+    # Estimate normals — needed by both Poisson and Ball Pivoting.
     bbox = pcd.get_axis_aligned_bounding_box()
     extent = float(np.linalg.norm(bbox.get_extent()))
-    radius_n = extent * 0.01     # 1% of scene diagonal — typical good choice
+    radius_n = extent * 0.01
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(
             radius=radius_n, max_nn=30))
     pcd.orient_normals_consistent_tangent_plane(50)
     print(f"[fuse] normals estimated (radius {radius_n:.4f})", flush=True)
 
-    # Poisson surface reconstruction
-    mesh, densities = (
-        o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=poisson_depth, width=0, scale=1.1, linear_fit=False)
-    )
-    print(f"[fuse] Poisson done: {len(mesh.vertices):,} verts, "
-          f"{len(mesh.triangles):,} faces", flush=True)
+    # Voxel-downsample so ball pivoting has a uniform point spacing to
+    # work with. Without this, the variable density of MASt3R pts3d
+    # (dense in textured regions, sparse on smooth skin) makes the
+    # ball-radius estimate unreliable and leaves big holes.
+    voxel = extent * 0.0015   # ~0.15% of scene diagonal
+    pcd_ds = pcd.voxel_down_sample(voxel)
+    pcd_ds.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius_n, max_nn=30))
+    pcd_ds.orient_normals_consistent_tangent_plane(50)
+    print(f"[fuse] voxel-downsampled (voxel={voxel:.4f}): "
+          f"{len(pcd_ds.points):,} points", flush=True)
 
-    # Trim ghost geometry: Poisson always produces a watertight surface,
-    # but verts in regions where the input point cloud was sparse have
-    # very low density and are usually nonsense. Drop them.
-    densities = np.asarray(densities)
-    if density_quantile > 0 and len(densities):
-        thr = float(np.quantile(densities, density_quantile))
-        keep = densities >= thr
-        mesh.remove_vertices_by_mask(~keep)
-        print(f"[fuse] trimmed density<{thr:.2f}: kept "
-              f"{int(keep.sum()):,}/{len(densities):,} verts",
-              flush=True)
+    # ------ Ball Pivoting reconstruction ------
+    # Ball Pivoting only triangulates between points that actually exist
+    # in the input cloud. No interpolation, no back-side hallucination.
+    # The resulting mesh is OPEN where there's no input data — exactly
+    # what we want for single-side photo captures.
+    dists = pcd_ds.compute_nearest_neighbor_distance()
+    avg_dist = float(np.mean(dists))
+    radii = [avg_dist * 1.5, avg_dist * 2.5, avg_dist * 4.0]
+    print(f"[fuse] ball pivoting radii: "
+          f"[{radii[0]:.4f}, {radii[1]:.4f}, {radii[2]:.4f}]",
+          flush=True)
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd_ds, o3d.utility.DoubleVector(radii)
+    )
+    print(f"[fuse] Ball-pivot done: {len(mesh.vertices):,} verts, "
+          f"{len(mesh.triangles):,} faces", flush=True)
 
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_triangles()
     mesh.remove_duplicated_vertices()
     mesh.remove_non_manifold_edges()
 
-    # Trim phantom geometry. Poisson produces a watertight mesh by
-    # extrapolating into regions without input data — for single-side
-    # captures that fabricates a fake "back side" + wing-like extrusions.
-    # Drop any mesh vertex farther than a fraction of the scene radius
-    # from the nearest input point.
-    try:
-        verts = np.asarray(mesh.vertices)
-        if len(verts):
-            pts_kd = o3d.geometry.KDTreeFlann(pcd)
-            scene_r = float(np.linalg.norm(bbox.get_extent())) * 0.5
-            cutoff = scene_r * 0.04   # 4% of scene radius
-            keep_vert = np.zeros(len(verts), dtype=bool)
-            for i, v in enumerate(verts):
-                _k, _idx, sq_dist = pts_kd.search_knn_vector_3d(v, 1)
-                if _k > 0 and sq_dist[0] < cutoff * cutoff:
-                    keep_vert[i] = True
-            n_drop = int((~keep_vert).sum())
-            if n_drop:
-                mesh.remove_vertices_by_mask(~keep_vert)
-                print(f"[fuse] trimmed {n_drop:,} phantom verts > {cutoff:.3f} "
-                      f"from any input point", flush=True)
-    except Exception as _e:
-        print(f"[fuse] phantom-vertex trim skipped: {_e}", flush=True)
+    # Phantom-vertex trim no longer needed — ball pivoting only
+    # triangulates between actual input points, so there's nothing to
+    # extrapolate or trim. The mesh is naturally open where data is
+    # absent.
 
     # Keep only the largest connected component. After Poisson + density
     # trimming we typically still have small floating triangle clusters

@@ -314,8 +314,14 @@ def project_views_to_texture(obj_path: Path, workdir: Path,
     cams = _read_cameras(sparse / "cameras.txt")
     imgs = _read_images(sparse / "images.txt")
 
-    accum  = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
-    weight = np.zeros((tex_size, tex_size),    dtype=np.float32)
+    # BEST-VIEW selection instead of weighted averaging.
+    # We accumulated colour over all views before, which mathematically
+    # dulls saturation: bright red + several greys → washed-out pink.
+    # Instead: for each texel, keep only the colour from the single
+    # most-face-on photo (highest cos(view_angle)). Sharper, fully
+    # saturated, true to the source photo. Same approach Polycam uses.
+    best_color  = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+    best_weight = np.zeros((tex_size, tex_size),    dtype=np.float32)
 
     valid_mask = (face_map >= 0)
     pos_flat = pos_map.reshape(-1, 3)
@@ -401,15 +407,18 @@ def project_views_to_texture(obj_path: Path, workdir: Path,
             w_tex *= (mask_remap.flatten() > 127).astype(np.float32)
 
         w_tex2d = w_tex.reshape(tex_size, tex_size)
-        accum += sampled.astype(np.float32) * w_tex2d[..., None]
-        weight += w_tex2d
+        # Best-view update: where this photo's weight beats the current
+        # best, replace colour AND weight. Everywhere else, leave as-is.
+        better = w_tex2d > best_weight
+        if better.any():
+            best_color[better] = sampled[better].astype(np.float32)
+            best_weight[better] = w_tex2d[better]
 
-    weight_safe = np.maximum(weight, 1e-6)
-    out = (accum / weight_safe[..., None]).clip(0, 255).astype(np.uint8)
+    out = best_color.clip(0, 255).astype(np.uint8)
 
     # Inpaint near the boundary of covered regions only — never invent
     # interior detail
-    cov = (weight > 1e-3).astype(np.uint8) * 255
+    cov = (best_weight > 1e-3).astype(np.uint8) * 255
     border = cv2.dilate(cov, np.ones((21, 21), np.uint8)) - cov
     inp_mask = (border > 0).astype(np.uint8)
     out = cv2.inpaint(out, inp_mask, 3, cv2.INPAINT_TELEA)
