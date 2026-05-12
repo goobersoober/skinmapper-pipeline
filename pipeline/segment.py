@@ -212,23 +212,45 @@ def segment_folder(image_dir: Path, mask_dir: Path, masked_dir: Path,
     counts = {"success": 0, "fallback": 0, "failed": 0}
 
     paths = sorted(p for p in image_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+    gdino_warning_logged = False
     for p in paths:
         img = np.array(Image.open(p).convert("RGB"))
+        mask = None
+        tag = None
+
+        # Try GroundingDINO + SAM2 box-prompted segmentation first
         try:
             box = seg.detect_box(img, prompt)
             if box is not None:
                 mask = seg.mask_from_box(img, box)
                 tag = "success"
-            else:
+        except Exception as e:
+            if not gdino_warning_logged:
+                # Log the first failure only; the rest will fall through quietly
+                print(f"  ! GroundingDINO failed on {p.name} ({e}); "
+                      f"using SAM2 centre-point fallback for all photos",
+                      flush=True)
+                gdino_warning_logged = True
+
+        # Fall back to SAM2 with a centre-point prompt. This bypasses
+        # GroundingDINO entirely (no Bert/transformers issues) and works
+        # fine for our usecase because the subject is always centred in
+        # tattoo-scan captures.
+        if mask is None:
+            try:
                 mask = seg.fallback_centre_mask(img)
                 tag = "fallback"
+            except Exception as e:
+                print(f"  ! SAM2 centre-point also failed on {p.name}: {e}",
+                      flush=True)
+                counts["failed"] += 1
+                # All-white mask only as a true last resort
+                mask = np.ones(img.shape[:2], dtype=np.uint8) * 255
+                tag = None
+
+        if tag is not None:
             mask = seg.clean_mask(mask)
             counts[tag] += 1
-        except Exception as e:
-            print(f"  ! segmentation failed on {p.name}: {e}")
-            counts["failed"] += 1
-            # keep a fully-white mask so the photo isn't wasted
-            mask = np.ones(img.shape[:2], dtype=np.uint8) * 255
 
         # Save mask
         cv2.imwrite(str(mask_dir / (p.stem + ".png")), mask)
