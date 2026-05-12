@@ -135,6 +135,32 @@ def fuse_depths_to_mesh(workdir: Path,
     mesh.remove_duplicated_vertices()
     mesh.remove_non_manifold_edges()
 
+    # Keep only the largest connected component. After Poisson + density
+    # trimming we typically still have small floating triangle clusters
+    # from outlier points (floor leaks, mask edges). The limb is by far
+    # the largest connected blob; everything else is debris.
+    try:
+        cluster_ids, cluster_n_tri, _cluster_area = (
+            mesh.cluster_connected_triangles())
+        cluster_ids = np.asarray(cluster_ids)
+        cluster_n_tri = np.asarray(cluster_n_tri)
+        if len(cluster_n_tri) > 1:
+            largest = int(np.argmax(cluster_n_tri))
+            drop_mask = cluster_ids != largest
+            n_dropped = int(drop_mask.sum())
+            mesh.remove_triangles_by_mask(drop_mask)
+            mesh.remove_unreferenced_vertices()
+            kept = len(cluster_n_tri) - 1
+            print(f"[fuse] kept largest of {len(cluster_n_tri)} clusters; "
+                  f"dropped {kept} smaller clusters ({n_dropped:,} tris)",
+                  flush=True)
+        else:
+            print(f"[fuse] mesh is one connected component ({int(cluster_n_tri[0]):,} tris)",
+                  flush=True)
+    except Exception as _e:
+        print(f"[fuse] connected-component cleanup skipped: {_e}",
+              flush=True)
+
     if out_ply is None:
         # Mirror the 2DGS output path so the rest of handler.py + extract
         # work unchanged

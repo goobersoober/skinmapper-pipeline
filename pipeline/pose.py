@@ -324,9 +324,11 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
             conf_np = conf.detach().cpu().numpy()  # (h, w)
             mh, mw = pts_np.shape[:2]
 
-            # Confidence filter — keep top 70% (was 50%, but with masks
-            # we can afford to be less selective on confidence)
-            conf_thr = np.percentile(conf_np, 30)
+            # Confidence filter — keep top 50% per view. Looser than this
+            # (e.g. top 70%) pulled in low-confidence MASt3R triangulations
+            # that ended up as floating debris and wall/floor sheets in the
+            # final Poisson reconstruction.
+            conf_thr = np.percentile(conf_np, 50)
             keep = conf_np >= conf_thr
 
             if masks_available:
@@ -337,6 +339,16 @@ def estimate_poses(image_paths: List[Path], workdir: Path,
                     if msk is not None:
                         msk = cv2.resize(msk, (mw, mh),
                                          interpolation=cv2.INTER_NEAREST)
+                        # Erode mask aggressively (~5% of long edge) to
+                        # avoid back-projecting sock/floor pixels at the
+                        # limb boundary into the point cloud. The mask
+                        # was made by SAM2 with a 3x3 grid prompt and can
+                        # include a few pixels of adjacent fabric.
+                        erode_px = max(3, int(0.05 * max(mh, mw)))
+                        kernel = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE,
+                            (2 * erode_px + 1, 2 * erode_px + 1))
+                        msk = cv2.erode(msk, kernel)
                         keep = keep & (msk > 127)
 
             xyz = pts_np[keep]
