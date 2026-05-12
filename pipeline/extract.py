@@ -191,10 +191,16 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
     new_vertices = vertices[vmapping]
 
     # --- Write OBJ with UVs manually (much faster + simpler than pymeshlab) ---
+    # Textures saved as JPEG, not PNG. At 4096x4096 the PNG is ~15MB;
+    # base64-wrapped in RunPod's JSON response that's ~20MB, which RunPod
+    # rejects with 400 Bad Request on the job-done endpoint. JPEG q92
+    # of a skin-texture atlas is ~1-3MB — fits comfortably.
+    # (Once we wire up presigned S3 upload_url, this becomes moot and
+    # we can go back to PNG for lossless texture.)
     out_dir.mkdir(parents=True, exist_ok=True)
     obj_path = out_dir / "mesh.obj"
-    tex_orig = out_dir / "mesh_original.png"
-    tex_albedo = out_dir / "mesh_albedo.png"
+    tex_orig = out_dir / "mesh_original.jpg"
+    tex_albedo = out_dir / "mesh_albedo.jpg"
     with obj_path.open("w") as f:
         f.write("mtllib mesh.mtl\nusemtl skin\n")
         for v in new_vertices:
@@ -217,8 +223,9 @@ def bake_textures(mesh_ply: Path, workdir: Path, out_dir: Path,
         tex_size=tex_size,
         mask_dir=mask_dir,
     )
-    cv2.imwrite(str(tex_orig), tex)
-    cv2.imwrite(str(tex_albedo), delight_texture(tex))
+    jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), 92]
+    cv2.imwrite(str(tex_orig), tex, jpeg_params)
+    cv2.imwrite(str(tex_albedo), delight_texture(tex), jpeg_params)
 
     # Write MTL
     mtl_path = out_dir / "mesh.mtl"
