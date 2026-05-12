@@ -361,11 +361,19 @@ def run_pipeline(job_input: dict) -> dict:
                                   tex_size=4096, mask_dir=mask_dir)
         _step(f"texture baking — {len(artefacts)} artefacts", t_step)
 
-        # 10. Pick texture(s) by scan_type
-        keep_original = scan_type in ("content", "post_tattoo", "both")
-        keep_albedo   = scan_type in ("design", "both", "default") or scan_type not in (
-            "content", "post_tattoo"
-        )
+        # 10. Pick texture(s) by scan_type.
+        # The albedo (de-lit) texture is intentionally desaturated — it's
+        # meant for tracing stencils where consistent lighting matters
+        # more than colour fidelity. For viewing the leg in Procreate /
+        # planning where a tattoo will sit, the original photo-colored
+        # texture is far more useful: real skin tones, vivid tattoo ink.
+        # Default to ORIGINAL for "design" and "both" so users see true
+        # colour. The de-lit albedo is still available via scan_type=
+        # "design_albedo" or "stencil".
+        keep_original = scan_type in (
+            "content", "post_tattoo", "design", "both", "default", "")
+        keep_albedo   = scan_type in (
+            "design_albedo", "stencil", "both")
         if keep_original and not keep_albedo:
             artefacts["albedo"].unlink(missing_ok=True)
             mtl = (

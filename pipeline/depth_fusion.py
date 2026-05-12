@@ -135,6 +135,30 @@ def fuse_depths_to_mesh(workdir: Path,
     mesh.remove_duplicated_vertices()
     mesh.remove_non_manifold_edges()
 
+    # Trim phantom geometry. Poisson produces a watertight mesh by
+    # extrapolating into regions without input data — for single-side
+    # captures that fabricates a fake "back side" + wing-like extrusions.
+    # Drop any mesh vertex farther than a fraction of the scene radius
+    # from the nearest input point.
+    try:
+        verts = np.asarray(mesh.vertices)
+        if len(verts):
+            pts_kd = o3d.geometry.KDTreeFlann(pcd)
+            scene_r = float(np.linalg.norm(bbox.get_extent())) * 0.5
+            cutoff = scene_r * 0.04   # 4% of scene radius
+            keep_vert = np.zeros(len(verts), dtype=bool)
+            for i, v in enumerate(verts):
+                _k, _idx, sq_dist = pts_kd.search_knn_vector_3d(v, 1)
+                if _k > 0 and sq_dist[0] < cutoff * cutoff:
+                    keep_vert[i] = True
+            n_drop = int((~keep_vert).sum())
+            if n_drop:
+                mesh.remove_vertices_by_mask(~keep_vert)
+                print(f"[fuse] trimmed {n_drop:,} phantom verts > {cutoff:.3f} "
+                      f"from any input point", flush=True)
+    except Exception as _e:
+        print(f"[fuse] phantom-vertex trim skipped: {_e}", flush=True)
+
     # Keep only the largest connected component. After Poisson + density
     # trimming we typically still have small floating triangle clusters
     # from outlier points (floor leaks, mask edges). The limb is by far
