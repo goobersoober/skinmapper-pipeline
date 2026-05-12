@@ -59,6 +59,107 @@ from pipeline.extract  import bake_textures
 _hb("all pipeline modules imported — ready to receive jobs")
 
 
+def _capture_initial_git_head() -> None:
+    """Seed _LAST_GIT_HEAD at module load so the first job doesn't think
+    code changed and trigger an unnecessary reload pass."""
+    import subprocess
+    global _LAST_GIT_HEAD
+    repo = Path("/workspace/skinmapper-pipeline")
+    if not repo.exists():
+        return
+    try:
+        _LAST_GIT_HEAD = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            text=True, timeout=10).strip()
+        _hb(f"initial code at git {_LAST_GIT_HEAD}")
+    except Exception as _e:
+        _hb(f"git HEAD read skipped: {_e}")
+
+
+# -------- hot-reload pipeline code per job --------
+#
+# RunPod serverless workers reuse one Python process across many jobs.
+# start.sh runs git pull at WORKER BOOT only, and imports are cached, so
+# any code change pushed to main is invisible to a warm worker until it
+# scales down and a new one starts. That meant we had to manually kill
+# workers after every push — incredibly annoying.
+#
+# Fix: at the start of every job, git pull + drop pipeline.* from
+# sys.modules + re-import. Heavy ML deps (torch, transformers, MASt3R,
+# SAM2 model weights) stay loaded; only our small Python files reload.
+# Cost: ~1-2 sec per job; code changes apply on the very next job.
+
+_LAST_GIT_HEAD: str | None = None
+
+
+def _hot_reload_pipeline() -> None:
+    """Pull latest pipeline code from GitHub and reload pipeline.* modules.
+
+    Only reloads when git HEAD has changed since last call, so warm
+    workers don't pay the reload cost on every single job — only when
+    code actually moved.
+    """
+    import importlib
+    import subprocess
+
+    global _LAST_GIT_HEAD
+
+    repo = Path("/workspace/skinmapper-pipeline")
+    if not repo.exists():
+        return  # local dev; skip
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "pull", "--quiet", "origin", "main"],
+            timeout=30, check=False,
+        )
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            text=True, timeout=10).strip()
+    except Exception as e:
+        print(f"[reload] git pull failed: {e}", flush=True)
+        return
+
+    if head == _LAST_GIT_HEAD:
+        return  # No new code; warm imports are fine
+    print(f"[reload] code changed {_LAST_GIT_HEAD} → {head} — reloading "
+          f"pipeline modules", flush=True)
+    _LAST_GIT_HEAD = head
+
+    # Drop our pipeline modules from sys.modules so the imports below
+    # pick up the new code from disk. Keep heavy ML deps (torch,
+    # transformers, mast3r, sam2, dust3r, groundingdino, open3d) loaded.
+    to_drop = [m for m in list(sys.modules)
+               if m == "pipeline" or m.startswith("pipeline.")]
+    for m in to_drop:
+        del sys.modules[m]
+
+    # Force re-imports so the module-level globals in this file point at
+    # the new code. The `globals()[...]` assignment is what makes the
+    # new versions visible to run_pipeline() below.
+    from pipeline.utils    import (list_photos, normalise_to_jpeg,
+                                   reject_blurry, make_workdir, cleanup)
+    from pipeline.segment  import segment_folder
+    from pipeline.depth    import estimate_depth_folder
+    from pipeline.pose     import estimate_poses
+    from pipeline.depth_fusion import fuse_depths_to_mesh
+    from pipeline.extract  import bake_textures
+
+    globals().update({
+        "list_photos": list_photos,
+        "normalise_to_jpeg": normalise_to_jpeg,
+        "reject_blurry": reject_blurry,
+        "make_workdir": make_workdir,
+        "cleanup": cleanup,
+        "segment_folder": segment_folder,
+        "estimate_depth_folder": estimate_depth_folder,
+        "estimate_poses": estimate_poses,
+        "fuse_depths_to_mesh": fuse_depths_to_mesh,
+        "bake_textures": bake_textures,
+    })
+    print(f"[reload] dropped {len(to_drop)} cached modules, "
+          "re-imported pipeline at {head}", flush=True)
+
+
 # -------- helpers --------
 
 def _download(url: str, dst: Path) -> None:
@@ -360,8 +461,12 @@ def run_pipeline(job_input: dict) -> dict:
 # -------- RunPod entry --------
 
 def handler(job):
+    # Pull + reload pipeline code at the start of every job. Skips
+    # silently if HEAD hasn't changed.
+    _hot_reload_pipeline()
     return run_pipeline(job["input"])
 
 
 if __name__ == "__main__":
+    _capture_initial_git_head()
     runpod.serverless.start({"handler": handler})
